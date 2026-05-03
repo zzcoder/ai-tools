@@ -1,0 +1,6 @@
+/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Children/KD03.Green_Motherland.mp3
+/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Children/KD02.Our_Fields.mp3
+/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Children/KD10.Happy_Holidays.mp3
+/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Children/KD25.QingHai_Blue.mp3
+/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Taiwan_HongKong/T14.Blue_Flower_Grass.au
+/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Taiwan_HongKong/T02.Tomorrow_Be_Better.au
