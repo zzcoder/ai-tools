@@ -3,13 +3,13 @@
 
 Typical use:
 
-    python3 tools/number_heads.py group-shot.JPG --detect
+    python3 tools/number_heads.py group-shot.png --detect
 
 That creates a first-pass CSV of head centers and writes a numbered image.
 For crowded photos, edit the CSV to add/remove/move points, then rerun without
 --detect:
 
-    python3 tools/number_heads.py group-shot.JPG --points group-shot-heads.csv
+    python3 tools/number_heads.py group-shot.png --points group-shot-heads.csv
 
 CSV format:
 
@@ -51,7 +51,16 @@ def default_points_path(image_path: Path) -> Path:
 
 
 def default_output_path(image_path: Path) -> Path:
-    return image_path.with_name(f"{image_path.stem}-numbered.jpg")
+    return image_path.with_name(f"{image_path.stem}-numbered.png")
+
+
+def write_numbered_image(path: Path, image: np.ndarray) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return cv2.imwrite(str(path), image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    if suffix == ".png":
+        return cv2.imwrite(str(path), image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+    return cv2.imwrite(str(path), image)
 
 
 def iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
@@ -771,7 +780,7 @@ def main() -> None:
         label_offset_y=args.label_offset_y,
         leader_lines=not args.no_leader_lines,
     )
-    ok = cv2.imwrite(str(output_path), numbered, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    ok = write_numbered_image(output_path, numbered)
     if not ok:
         raise SystemExit(f"Could not write output: {output_path}")
 

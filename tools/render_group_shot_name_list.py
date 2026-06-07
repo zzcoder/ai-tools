@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input",
-        default="group-shot-numbered.jpg",
+        default="group-shot-numbered.png",
         help="Numbered group-shot image.",
     )
     parser.add_argument(

@@ -14,7 +14,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,22 +38,14 @@ DATE_TAGS = (
     (306, "DateTime"),
 )
 
-TITLE = "Earth Day Volunteering 2026"
+TITLE = "Photo Slideshow"
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 15
 TITLE_DURATION = 6.0
 TRANSITION_DURATION = 0.6
-FIT_SCALE_STEP = 0.001
 
-AUDIO_FILES = [
-    "/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Children/KD03.Green_Motherland.mp3",
-    "/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Children/KD02.Our_Fields.mp3",
-    "/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Children/KD10.Happy_Holidays.mp3",
-    "/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Children/KD25.QingHai_Blue.mp3",
-    "/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Taiwan_HongKong/T14.Blue_Flower_Grass.au",
-    "/mnt/synology-drive/backup/qnap-homes/zhang/chinese-music-archive/chinese-music/Taiwan_HongKong/T02.Tomorrow_Be_Better.au",
-]
+DEFAULT_AUDIO_FILES: list[str] = []
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,17 +53,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-dir",
         type=Path,
-        default=Path("/home/zhihongz/codex-workspace/tree-planting"),
+        required=True,
+        help="Directory containing source photos.",
     )
     parser.add_argument(
         "--build-dir",
         type=Path,
-        default=Path("/home/zhihongz/codex-workspace/tree-planting-slideshow-build"),
+        default=Path("slideshow-build"),
+        help="Directory for temporary render assets and reports.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/home/zhihongz/codex-workspace/tree-planting/Earth_Day_Volunteering_2026_slideshow.mp4"),
+        default=Path("slideshow.mp4"),
+        help="Output MP4 path.",
     )
     parser.add_argument("--limit", type=int, default=0, help="Render only the first N images.")
     parser.add_argument(
@@ -82,19 +77,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--title", default=TITLE)
     parser.add_argument(
+        "--no-title-card",
+        action="store_true",
+        help="Start directly with photos instead of generating and rendering a title card.",
+    )
+    parser.add_argument(
         "--audio",
         type=Path,
         action="append",
         default=[],
-        help="Audio file to include. Repeat this option for multiple tracks. Defaults to the Earth Day music list.",
+        help="Audio file to include. Repeat this option for multiple tracks.",
     )
     parser.add_argument(
         "--audio-list",
         type=Path,
         help="Text file containing one audio path per line. Blank lines and lines starting with # are ignored.",
     )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=0.0,
+        help="Render duration in seconds when no audio is supplied. Creates a silent audio track.",
+    )
     parser.add_argument("--title-duration", type=float, default=TITLE_DURATION)
     parser.add_argument("--transition-duration", type=float, default=TRANSITION_DURATION)
+    parser.add_argument(
+        "--transition-style",
+        choices=("crossfade", "dip-black", "dip-white"),
+        default="crossfade",
+        help="Visual transition style between photos.",
+    )
     parser.add_argument(
         "--encoder",
         choices=("auto", "h264_nvenc", "libx264"),
@@ -107,13 +119,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument(
         "--motion",
-        choices=("static", "kenburns", "fit"),
+        choices=("static", "kenburns", "fit", "reveal"),
         default="static",
-        help="Use kenburns for full-screen crop, or fit for full-image motion with no cropping.",
+        help="Use kenburns for full-screen crop, fit for full-image motion, or reveal to zoom between full-screen crop and full-picture fit.",
     )
     parser.add_argument("--seed", type=int, default=20260422)
     parser.add_argument("--zoom-min", type=float, default=1.03)
     parser.add_argument("--zoom-max", type=float, default=1.16)
+    parser.add_argument(
+        "--no-pan",
+        action="store_true",
+        help="Keep motion centered instead of moving across the photo.",
+    )
+    parser.add_argument(
+        "--zoom-direction",
+        choices=("random", "in", "out", "alternate"),
+        default="random",
+        help="Direction for kenburns zoom motion.",
+    )
+    parser.add_argument(
+        "--fit-zoom",
+        type=float,
+        default=0.0,
+        help="Subtle zoom amount for fit motion. 0.08 means photos grow by about 8 percent.",
+    )
+    parser.add_argument(
+        "--fit-pan",
+        type=float,
+        default=0.14,
+        help="Normalized fit-motion pan range around center. Smaller values reduce lateral drift.",
+    )
     parser.add_argument(
         "--max-duration",
         type=float,
@@ -131,7 +166,7 @@ def audio_paths_from_args(args: argparse.Namespace) -> list[Path]:
             if stripped and not stripped.startswith("#"):
                 paths.append(Path(stripped))
     paths.extend(args.audio)
-    return paths or [Path(path) for path in AUDIO_FILES]
+    return paths or [Path(path) for path in DEFAULT_AUDIO_FILES]
 
 
 def run(command: list[str]) -> None:
@@ -172,6 +207,21 @@ def parse_datetime(value: Any) -> datetime | None:
     return None
 
 
+def timestamp_from_filename(path: Path) -> tuple[datetime, str] | None:
+    epoch_match = re.search(r"(\d{10})(?=\D*$)", path.stem)
+    if epoch_match:
+        epoch = int(epoch_match.group(1))
+        if 946684800 <= epoch <= 4102444800:
+            return datetime.fromtimestamp(epoch), "filename_epoch"
+
+    staged_match = re.match(r"^(\d{4,})-", path.name)
+    if staged_match:
+        order = int(staged_match.group(1))
+        return datetime(1970, 1, 1) + timedelta(seconds=order), "staged_order"
+
+    return None
+
+
 def image_timestamp(path: Path) -> tuple[datetime, str]:
     try:
         with Image.open(path) as image:
@@ -183,6 +233,9 @@ def image_timestamp(path: Path) -> tuple[datetime, str]:
                         return parsed, label
     except Exception:
         pass
+    filename_timestamp = timestamp_from_filename(path)
+    if filename_timestamp:
+        return filename_timestamp
     return datetime.fromtimestamp(path.stat().st_mtime), "mtime"
 
 
@@ -332,6 +385,26 @@ def create_audio(audio_paths: list[Path], output: Path) -> None:
     manifest.write_text(json.dumps(source_state, indent=2), encoding="utf-8")
 
 
+def create_silent_audio(duration: float, output: Path) -> None:
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-t",
+            f"{duration:.3f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            str(output),
+        ]
+    )
+
+
 def encoder_available(name: str) -> bool:
     return (
         subprocess.run(
@@ -388,7 +461,7 @@ def stable_seed(seed: int, index: int, path: Path) -> int:
 
 def smoothstep(value: float) -> float:
     value = max(0.0, min(1.0, value))
-    return value * value * (3.0 - 2.0 * value)
+    return value * value * value * (value * (value * 6.0 - 15.0) + 10.0)
 
 
 @dataclass
@@ -447,29 +520,84 @@ class FitMotionClip:
     def frame(self, progress: float) -> Image.Image:
         eased = smoothstep(progress)
         scale_factor = self.scale_start + (self.scale_end - self.scale_start) * eased
-        quantized_scale = min(1.0, max(0.01, round(scale_factor / FIT_SCALE_STEP) * FIT_SCALE_STEP))
-        width = max(1, round(self.foreground_max.width * quantized_scale))
-        height = max(1, round(self.foreground_max.height * quantized_scale))
+        scale_factor = min(1.0, max(0.01, scale_factor))
+        width = max(1, round(self.foreground_max.width * scale_factor))
+        height = max(1, round(self.foreground_max.height * scale_factor))
         foreground, shadow = self.assets(width, height)
 
         pan_x = self.start_xy[0] + (self.end_xy[0] - self.start_xy[0]) * eased
         pan_y = self.start_xy[1] + (self.end_xy[1] - self.start_xy[1]) * eased
-        x = round((WIDTH - width) * pan_x)
-        y = round((HEIGHT - height) * pan_y)
+        x = (WIDTH - width) * pan_x
+        y = (HEIGHT - height) * pan_y
+        foreground_x = math.floor(x)
+        foreground_y = math.floor(y)
+        foreground = subpixel_shift(foreground, x - foreground_x, y - foreground_y)
+
+        shadow_x = x - self.shadow_pad // 2 + self.shadow_pad // 5
+        shadow_y = y - self.shadow_pad // 2 + self.shadow_pad // 4
+        shadow_floor_x = math.floor(shadow_x)
+        shadow_floor_y = math.floor(shadow_y)
+        shadow = subpixel_shift(shadow, shadow_x - shadow_floor_x, shadow_y - shadow_floor_y)
 
         canvas = self.background.copy()
-        canvas.alpha_composite(
-            shadow,
-            (
-                x - self.shadow_pad // 2 + self.shadow_pad // 5,
-                y - self.shadow_pad // 2 + self.shadow_pad // 4,
-            ),
-        )
-        canvas.alpha_composite(foreground, (x, y))
+        canvas.alpha_composite(shadow, (shadow_floor_x, shadow_floor_y))
+        canvas.alpha_composite(foreground, (foreground_x, foreground_y))
         return canvas.convert("RGB")
 
 
-def create_motion_clip(path: Path, index: int, seed: int, zoom_min: float, zoom_max: float) -> MotionClip:
+@dataclass
+class RevealMotionClip:
+    photo_max: Image.Image
+    background: Image.Image
+    scale_start: float
+    scale_end: float
+
+    def frame(self, progress: float) -> Image.Image:
+        eased = smoothstep(progress)
+        scale = self.scale_start + (self.scale_end - self.scale_start) * eased
+        width = max(1, round(self.photo_max.width * scale))
+        height = max(1, round(self.photo_max.height * scale))
+        foreground = self.photo_max.resize((width, height), Image.Resampling.BICUBIC)
+        x = (WIDTH - width) // 2
+        y = (HEIGHT - height) // 2
+        canvas = self.background.copy()
+
+        dst_left = max(0, x)
+        dst_top = max(0, y)
+        dst_right = min(WIDTH, x + width)
+        dst_bottom = min(HEIGHT, y + height)
+        if dst_right <= dst_left or dst_bottom <= dst_top:
+            return canvas
+
+        src_left = max(0, -x)
+        src_top = max(0, -y)
+        src_right = src_left + (dst_right - dst_left)
+        src_bottom = src_top + (dst_bottom - dst_top)
+        canvas.paste(foreground.crop((src_left, src_top, src_right, src_bottom)), (dst_left, dst_top))
+        return canvas
+
+
+def subpixel_shift(image: Image.Image, frac_x: float, frac_y: float) -> Image.Image:
+    if abs(frac_x) < 0.001 and abs(frac_y) < 0.001:
+        return image
+    return image.transform(
+        image.size,
+        Image.Transform.AFFINE,
+        (1, 0, -frac_x, 0, 1, -frac_y),
+        resample=Image.Resampling.BICUBIC,
+        fillcolor=(0, 0, 0, 0),
+    )
+
+
+def create_motion_clip(
+    path: Path,
+    index: int,
+    seed: int,
+    zoom_min: float,
+    zoom_max: float,
+    no_pan: bool,
+    zoom_direction: str,
+) -> MotionClip:
     rng = random.Random(stable_seed(seed, index, path))
     with Image.open(path) as opened:
         photo = ImageOps.exif_transpose(opened).convert("RGB")
@@ -480,12 +608,22 @@ def create_motion_clip(path: Path, index: int, seed: int, zoom_min: float, zoom_
     source_size = (math.ceil(photo.width * scale), math.ceil(photo.height * scale))
     source = photo.resize(source_size, Image.Resampling.LANCZOS)
 
-    start_xy = (rng.random(), rng.random())
-    end_xy = (rng.random(), rng.random())
-    if abs(start_xy[0] - end_xy[0]) + abs(start_xy[1] - end_xy[1]) < 0.45:
-        end_xy = (1.0 - start_xy[0], 1.0 - start_xy[1])
+    if no_pan:
+        start_xy = (0.5, 0.5)
+        end_xy = (0.5, 0.5)
+    else:
+        start_xy = (rng.random(), rng.random())
+        end_xy = (rng.random(), rng.random())
+        if abs(start_xy[0] - end_xy[0]) + abs(start_xy[1] - end_xy[1]) < 0.45:
+            end_xy = (1.0 - start_xy[0], 1.0 - start_xy[1])
 
-    if rng.random() < 0.72:
+    if zoom_direction == "in" or zoom_direction == "alternate" and index % 2 == 0:
+        zoom_start = zoom_min
+        zoom_end = zoom_max
+    elif zoom_direction == "out" or zoom_direction == "alternate":
+        zoom_start = zoom_max
+        zoom_end = zoom_min
+    elif rng.random() < 0.72:
         zoom_start = rng.uniform(zoom_min, (zoom_min + zoom_max) / 2)
         zoom_end = rng.uniform((zoom_min + zoom_max) / 2, zoom_max)
     else:
@@ -502,7 +640,7 @@ def create_motion_clip(path: Path, index: int, seed: int, zoom_min: float, zoom_
     )
 
 
-def create_fit_motion_clip(path: Path, index: int, seed: int) -> FitMotionClip:
+def create_fit_motion_clip(path: Path, index: int, seed: int, fit_zoom: float, fit_pan: float) -> FitMotionClip:
     rng = random.Random(stable_seed(seed, index, path))
     with Image.open(path) as opened:
         photo = ImageOps.exif_transpose(opened).convert("RGB")
@@ -535,13 +673,23 @@ def create_fit_motion_clip(path: Path, index: int, seed: int) -> FitMotionClip:
     )
     shadow_max = shadow_max.filter(ImageFilter.GaussianBlur(max(10, shadow_pad // 3)))
 
-    start_xy = (0.5 + rng.uniform(-0.14, 0.14), 0.5 + rng.uniform(-0.11, 0.11))
-    end_xy = (0.5 + rng.uniform(-0.14, 0.14), 0.5 + rng.uniform(-0.11, 0.11))
+    pan_x = max(0.0, fit_pan)
+    pan_y = max(0.0, fit_pan * 0.78)
+    start_xy = (0.5 + rng.uniform(-pan_x, pan_x), 0.5 + rng.uniform(-pan_y, pan_y))
+    end_xy = (0.5 + rng.uniform(-pan_x, pan_x), 0.5 + rng.uniform(-pan_y, pan_y))
     if abs(start_xy[0] - end_xy[0]) + abs(start_xy[1] - end_xy[1]) < 0.12:
         end_xy = (1.0 - start_xy[0], 1.0 - start_xy[1])
 
-    scale_start = 1.0
-    scale_end = 1.0
+    fit_zoom = min(0.18, max(0.0, fit_zoom))
+    if fit_zoom and rng.random() < 0.82:
+        scale_start = 1.0 - fit_zoom
+        scale_end = 1.0
+    elif fit_zoom:
+        scale_start = 1.0
+        scale_end = 1.0 - fit_zoom
+    else:
+        scale_start = 1.0
+        scale_end = 1.0
 
     return FitMotionClip(
         foreground_max=foreground_max,
@@ -550,6 +698,49 @@ def create_fit_motion_clip(path: Path, index: int, seed: int) -> FitMotionClip:
         background=background,
         start_xy=start_xy,
         end_xy=end_xy,
+        scale_start=scale_start,
+        scale_end=scale_end,
+    )
+
+
+def create_reveal_motion_clip(
+    path: Path,
+    index: int,
+    seed: int,
+    zoom_max: float,
+    zoom_direction: str,
+) -> RevealMotionClip:
+    rng = random.Random(stable_seed(seed, index, path))
+    with Image.open(path) as opened:
+        photo = ImageOps.exif_transpose(opened).convert("RGB")
+
+    background = ImageOps.fit(photo, (WIDTH, HEIGHT), method=Image.Resampling.BICUBIC)
+    background = background.filter(ImageFilter.GaussianBlur(max(18, round(min(WIDTH, HEIGHT) * 0.022))))
+    background = Image.blend(background, Image.new("RGB", (WIDTH, HEIGHT), (15, 22, 18)), 0.36)
+
+    contain_scale = min(WIDTH / photo.width, HEIGHT / photo.height)
+    cover_scale = max(WIDTH / photo.width, HEIGHT / photo.height)
+    cropped_scale = max(cover_scale, contain_scale * max(1.0, zoom_max))
+    max_size = (max(1, round(photo.width * cropped_scale)), max(1, round(photo.height * cropped_scale)))
+    photo_max = photo.resize(max_size, Image.Resampling.LANCZOS)
+    contain_ratio = contain_scale / cropped_scale
+
+    if zoom_direction == "in" or zoom_direction == "alternate" and index % 2 == 0:
+        scale_start = contain_ratio
+        scale_end = 1.0
+    elif zoom_direction == "out" or zoom_direction == "alternate":
+        scale_start = 1.0
+        scale_end = contain_ratio
+    elif rng.random() < 0.5:
+        scale_start = contain_ratio
+        scale_end = 1.0
+    else:
+        scale_start = 1.0
+        scale_end = contain_ratio
+
+    return RevealMotionClip(
+        photo_max=photo_max,
+        background=background,
         scale_start=scale_start,
         scale_end=scale_end,
     )
@@ -590,6 +781,22 @@ def write_crossfade_frames(
     for frame_index in range(1, count + 1):
         alpha = frame_index / (count + 1)
         write_frame(process, Image.blend(current, next_frame, alpha))
+
+
+def transition_frame(
+    current: Image.Image,
+    next_frame: Image.Image,
+    alpha: float,
+    style: str,
+) -> Image.Image:
+    if style == "crossfade":
+        return Image.blend(current, next_frame, alpha)
+
+    fill = (255, 255, 255) if style == "dip-white" else (0, 0, 0)
+    midpoint = Image.new("RGB", (WIDTH, HEIGHT), fill)
+    if alpha < 0.5:
+        return Image.blend(current, midpoint, smoothstep(alpha * 2.0))
+    return Image.blend(midpoint, next_frame, smoothstep((alpha - 0.5) * 2.0))
 
 
 def video_command(
@@ -673,7 +880,7 @@ def video_command(
 
 def render_streamed_slideshow(
     image_items: list[tuple[Path, datetime, str]],
-    title_card: Path,
+    title_card: Path | None,
     audio_file: Path,
     output: Path,
     duration: float,
@@ -682,7 +889,7 @@ def render_streamed_slideshow(
     gpu: int,
 ) -> None:
     total_frames = max(1, math.ceil(duration * fps))
-    title_frames = min(total_frames, max(1, round(TITLE_DURATION * fps)))
+    title_frames = min(total_frames, max(1, round(TITLE_DURATION * fps))) if title_card else 0
     transition_frames = max(1, round(TRANSITION_DURATION * fps))
     temp_output = output.with_name(f"{output.stem}.tmp{output.suffix}")
     if temp_output.exists():
@@ -693,16 +900,17 @@ def render_streamed_slideshow(
     process = subprocess.Popen(command, stdin=subprocess.PIPE)
 
     frames_written = 0
-    with Image.open(title_card) as opened:
-        title_frame = opened.convert("RGB")
     current = compose_photo_frame(image_items[0][0])
 
-    title_xfade_frames = min(transition_frames, max(0, title_frames - 1))
-    title_hold_frames = title_frames - title_xfade_frames
-    write_repeated_frames(process, title_frame, title_hold_frames)
-    frames_written += title_hold_frames
-    write_crossfade_frames(process, title_frame, current, title_xfade_frames)
-    frames_written += title_xfade_frames
+    if title_card:
+        with Image.open(title_card) as opened:
+            title_frame = opened.convert("RGB")
+        title_xfade_frames = min(transition_frames, max(0, title_frames - 1))
+        title_hold_frames = title_frames - title_xfade_frames
+        write_repeated_frames(process, title_frame, title_hold_frames)
+        frames_written += title_hold_frames
+        write_crossfade_frames(process, title_frame, current, title_xfade_frames)
+        frames_written += title_xfade_frames
 
     image_frames = max(0, total_frames - frames_written)
     image_count = len(image_items)
@@ -737,7 +945,7 @@ def render_streamed_slideshow(
 
 def render_kenburns_slideshow(
     image_items: list[tuple[Path, datetime, str]],
-    title_card: Path,
+    title_card: Path | None,
     audio_file: Path,
     output: Path,
     duration: float,
@@ -747,9 +955,12 @@ def render_kenburns_slideshow(
     seed: int,
     zoom_min: float,
     zoom_max: float,
+    no_pan: bool,
+    zoom_direction: str,
+    transition_style: str,
 ) -> None:
     total_frames = max(1, math.ceil(duration * fps))
-    title_frames = min(total_frames, max(1, round(TITLE_DURATION * fps)))
+    title_frames = min(total_frames, max(1, round(TITLE_DURATION * fps))) if title_card else 0
     transition_frames = max(1, round(TRANSITION_DURATION * fps))
     image_frames = max(1, total_frames - title_frames)
     image_count = len(image_items)
@@ -762,26 +973,34 @@ def render_kenburns_slideshow(
     print(" ".join(command[:18]) + " ...", flush=True)
     process = subprocess.Popen(command, stdin=subprocess.PIPE)
 
-    with Image.open(title_card) as opened:
-        title_frame = opened.convert("RGB")
-
     clip_cache: dict[int, MotionClip] = {}
 
     def clip(index: int) -> MotionClip:
         if index not in clip_cache:
-            clip_cache[index] = create_motion_clip(image_items[index][0], index, seed, zoom_min, zoom_max)
+            clip_cache[index] = create_motion_clip(
+                image_items[index][0],
+                index,
+                seed,
+                zoom_min,
+                zoom_max,
+                no_pan,
+                zoom_direction,
+            )
             for cached_index in list(clip_cache):
                 if cached_index < index - 1 or cached_index > index + 2:
                     del clip_cache[cached_index]
         return clip_cache[index]
 
-    title_hold_frames = max(0, title_frames - transition_frames)
-    for frame_number in range(title_frames):
-        if frame_number < title_hold_frames:
-            write_frame(process, title_frame)
-            continue
-        alpha = smoothstep((frame_number - title_hold_frames + 1) / (transition_frames + 1))
-        write_frame(process, Image.blend(title_frame, clip(0).frame(0.0), alpha))
+    if title_card:
+        with Image.open(title_card) as opened:
+            title_frame = opened.convert("RGB")
+        title_hold_frames = max(0, title_frames - transition_frames)
+        for frame_number in range(title_frames):
+            if frame_number < title_hold_frames:
+                write_frame(process, title_frame)
+                continue
+            alpha = smoothstep((frame_number - title_hold_frames + 1) / (transition_frames + 1))
+            write_frame(process, Image.blend(title_frame, clip(0).frame(0.0), alpha))
 
     for t in range(image_frames):
         index = max(0, min(image_count - 1, bisect.bisect_right(boundaries, t) - 1))
@@ -797,7 +1016,7 @@ def render_kenburns_slideshow(
             next_visible_end = max(next_visible_start + 1, boundaries[index + 2])
             next_progress = (t - next_visible_start) / (next_visible_end - next_visible_start)
             alpha = smoothstep((t - next_visible_start + 1) / (transition_frames + 1))
-            frame = Image.blend(frame, clip(index + 1).frame(next_progress), alpha)
+            frame = transition_frame(frame, clip(index + 1).frame(next_progress), alpha, transition_style)
 
         write_frame(process, frame)
         if t == 0 or t + 1 == image_frames or (index + 1) % 25 == 0 and t == segment_start:
@@ -813,7 +1032,7 @@ def render_kenburns_slideshow(
 
 def render_fit_motion_slideshow(
     image_items: list[tuple[Path, datetime, str]],
-    title_card: Path,
+    title_card: Path | None,
     audio_file: Path,
     output: Path,
     duration: float,
@@ -821,9 +1040,12 @@ def render_fit_motion_slideshow(
     encoder: str,
     gpu: int,
     seed: int,
+    fit_zoom: float,
+    fit_pan: float,
+    transition_style: str,
 ) -> None:
     total_frames = max(1, math.ceil(duration * fps))
-    title_frames = min(total_frames, max(1, round(TITLE_DURATION * fps)))
+    title_frames = min(total_frames, max(1, round(TITLE_DURATION * fps))) if title_card else 0
     transition_frames = max(1, round(TRANSITION_DURATION * fps))
     image_frames = max(1, total_frames - title_frames)
     image_count = len(image_items)
@@ -836,26 +1058,26 @@ def render_fit_motion_slideshow(
     print(" ".join(command[:18]) + " ...", flush=True)
     process = subprocess.Popen(command, stdin=subprocess.PIPE)
 
-    with Image.open(title_card) as opened:
-        title_frame = opened.convert("RGB")
-
     clip_cache: dict[int, FitMotionClip] = {}
 
     def clip(index: int) -> FitMotionClip:
         if index not in clip_cache:
-            clip_cache[index] = create_fit_motion_clip(image_items[index][0], index, seed)
+            clip_cache[index] = create_fit_motion_clip(image_items[index][0], index, seed, fit_zoom, fit_pan)
             for cached_index in list(clip_cache):
                 if cached_index < index - 1 or cached_index > index + 2:
                     del clip_cache[cached_index]
         return clip_cache[index]
 
-    title_hold_frames = max(0, title_frames - transition_frames)
-    for frame_number in range(title_frames):
-        if frame_number < title_hold_frames:
-            write_frame(process, title_frame)
-            continue
-        alpha = smoothstep((frame_number - title_hold_frames + 1) / (transition_frames + 1))
-        write_frame(process, Image.blend(title_frame, clip(0).frame(0.0), alpha))
+    if title_card:
+        with Image.open(title_card) as opened:
+            title_frame = opened.convert("RGB")
+        title_hold_frames = max(0, title_frames - transition_frames)
+        for frame_number in range(title_frames):
+            if frame_number < title_hold_frames:
+                write_frame(process, title_frame)
+                continue
+            alpha = smoothstep((frame_number - title_hold_frames + 1) / (transition_frames + 1))
+            write_frame(process, Image.blend(title_frame, clip(0).frame(0.0), alpha))
 
     for t in range(image_frames):
         index = max(0, min(image_count - 1, bisect.bisect_right(boundaries, t) - 1))
@@ -871,7 +1093,90 @@ def render_fit_motion_slideshow(
             next_visible_end = max(next_visible_start + 1, boundaries[index + 2])
             next_progress = (t - next_visible_start) / (next_visible_end - next_visible_start)
             alpha = smoothstep((t - next_visible_start + 1) / (transition_frames + 1))
-            frame = Image.blend(frame, clip(index + 1).frame(next_progress), alpha)
+            frame = transition_frame(frame, clip(index + 1).frame(next_progress), alpha, transition_style)
+
+        write_frame(process, frame)
+        if t == 0 or t + 1 == image_frames or (index + 1) % 25 == 0 and t == segment_start:
+            print(f"rendered frame {t + 1}/{image_frames}, image {index + 1}/{image_count}", flush=True)
+
+    if process.stdin is not None:
+        process.stdin.close()
+    return_code = process.wait()
+    if return_code != 0:
+        raise SystemExit(f"ffmpeg render failed with exit code {return_code}")
+    temp_output.replace(output)
+
+
+def render_reveal_motion_slideshow(
+    image_items: list[tuple[Path, datetime, str]],
+    title_card: Path | None,
+    audio_file: Path,
+    output: Path,
+    duration: float,
+    fps: int,
+    encoder: str,
+    gpu: int,
+    seed: int,
+    zoom_max: float,
+    zoom_direction: str,
+    transition_style: str,
+) -> None:
+    total_frames = max(1, math.ceil(duration * fps))
+    title_frames = min(total_frames, max(1, round(TITLE_DURATION * fps))) if title_card else 0
+    transition_frames = max(1, round(TRANSITION_DURATION * fps))
+    image_frames = max(1, total_frames - title_frames)
+    image_count = len(image_items)
+    boundaries = [round(index * image_frames / image_count) for index in range(image_count + 1)]
+    temp_output = output.with_name(f"{output.stem}.tmp{output.suffix}")
+    if temp_output.exists():
+        temp_output.unlink()
+
+    command = video_command(temp_output, audio_file, duration, fps, encoder, gpu)
+    print(" ".join(command[:18]) + " ...", flush=True)
+    process = subprocess.Popen(command, stdin=subprocess.PIPE)
+
+    clip_cache: dict[int, RevealMotionClip] = {}
+
+    def clip(index: int) -> RevealMotionClip:
+        if index not in clip_cache:
+            clip_cache[index] = create_reveal_motion_clip(
+                image_items[index][0],
+                index,
+                seed,
+                zoom_max,
+                zoom_direction,
+            )
+            for cached_index in list(clip_cache):
+                if cached_index < index - 1 or cached_index > index + 2:
+                    del clip_cache[cached_index]
+        return clip_cache[index]
+
+    if title_card:
+        with Image.open(title_card) as opened:
+            title_frame = opened.convert("RGB")
+        title_hold_frames = max(0, title_frames - transition_frames)
+        for frame_number in range(title_frames):
+            if frame_number < title_hold_frames:
+                write_frame(process, title_frame)
+                continue
+            alpha = smoothstep((frame_number - title_hold_frames + 1) / (transition_frames + 1))
+            write_frame(process, Image.blend(title_frame, clip(0).frame(0.0), alpha))
+
+    for t in range(image_frames):
+        index = max(0, min(image_count - 1, bisect.bisect_right(boundaries, t) - 1))
+        segment_start = boundaries[index]
+        segment_end = boundaries[index + 1]
+        visible_start = max(0, segment_start - (transition_frames if index > 0 else 0))
+        visible_end = max(visible_start + 1, segment_end)
+        current_progress = (t - visible_start) / (visible_end - visible_start)
+        frame = clip(index).frame(current_progress)
+
+        if index + 1 < image_count and t >= segment_end - transition_frames:
+            next_visible_start = segment_end - transition_frames
+            next_visible_end = max(next_visible_start + 1, boundaries[index + 2])
+            next_progress = (t - next_visible_start) / (next_visible_end - next_visible_start)
+            alpha = smoothstep((t - next_visible_start + 1) / (transition_frames + 1))
+            frame = transition_frame(frame, clip(index + 1).frame(next_progress), alpha, transition_style)
 
         write_frame(process, frame)
         if t == 0 or t + 1 == image_frames or (index + 1) % 25 == 0 and t == segment_start:
@@ -951,16 +1256,24 @@ def main() -> int:
     if missing_audio:
         raise SystemExit(f"Missing audio files: {missing_audio}")
 
-    title_card = args.build_dir / "title-card.jpg"
-    audio_file = args.build_dir / "earth-day-music.m4a"
+    title_card = None if args.no_title_card else args.build_dir / "title-card.jpg"
+    audio_file = args.build_dir / "slideshow-audio.m4a"
     order_report = args.build_dir / "timestamp-order.csv"
     summary_file = args.build_dir / "render-summary.json"
 
-    create_title_card(title_card, args.title)
-    create_audio(audio_paths, audio_file)
-    audio_duration = probe_duration(audio_file)
+    if title_card:
+        create_title_card(title_card, args.title)
+    if audio_paths:
+        create_audio(audio_paths, audio_file)
+        audio_duration = probe_duration(audio_file)
+    else:
+        if args.duration <= 0:
+            raise SystemExit("Provide --audio/--audio-list, or set --duration for a silent slideshow")
+        create_silent_audio(args.duration, audio_file)
+        audio_duration = args.duration
     render_duration = min(audio_duration, args.max_duration) if args.max_duration > 0 else audio_duration
-    image_duration = (render_duration - TITLE_DURATION + len(image_items) * TRANSITION_DURATION) / len(image_items)
+    effective_title_duration = 0.0 if args.no_title_card else TITLE_DURATION
+    image_duration = (render_duration - effective_title_duration + len(image_items) * TRANSITION_DURATION) / len(image_items)
     if image_duration <= TRANSITION_DURATION + 0.2:
         raise SystemExit("Audio is too short for the number of images and transition duration")
 
@@ -980,6 +1293,9 @@ def main() -> int:
             seed=args.seed,
             zoom_min=args.zoom_min,
             zoom_max=args.zoom_max,
+            no_pan=args.no_pan,
+            zoom_direction=args.zoom_direction,
+            transition_style=args.transition_style,
         )
     elif args.motion == "fit":
         render_fit_motion_slideshow(
@@ -992,6 +1308,24 @@ def main() -> int:
             encoder=encoder,
             gpu=args.gpu,
             seed=args.seed,
+            fit_zoom=args.fit_zoom,
+            fit_pan=args.fit_pan,
+            transition_style=args.transition_style,
+        )
+    elif args.motion == "reveal":
+        render_reveal_motion_slideshow(
+            image_items=image_items,
+            title_card=title_card,
+            audio_file=audio_file,
+            output=args.output,
+            duration=render_duration,
+            fps=args.fps,
+            encoder=encoder,
+            gpu=args.gpu,
+            seed=args.seed,
+            zoom_max=args.zoom_max,
+            zoom_direction=args.zoom_direction,
+            transition_style=args.transition_style,
         )
     else:
         render_streamed_slideshow(
@@ -1011,17 +1345,23 @@ def main() -> int:
         "image_count": len(image_items),
         "audio_duration_seconds": audio_duration,
         "render_duration_seconds": render_duration,
-        "title_duration_seconds": TITLE_DURATION,
+        "title_duration_seconds": effective_title_duration,
+        "title_card": None if args.no_title_card else str(title_card),
         "transition_duration_seconds": TRANSITION_DURATION,
+        "transition_style": args.transition_style,
         "image_clip_duration_seconds": image_duration,
         "new_image_cadence_seconds": image_duration - TRANSITION_DURATION,
         "fps": args.fps,
         "width": WIDTH,
         "height": HEIGHT,
         "motion": args.motion,
-        "seed": args.seed if args.motion in {"kenburns", "fit"} else None,
+        "seed": args.seed if args.motion in {"kenburns", "fit", "reveal"} else None,
         "zoom_min": args.zoom_min if args.motion == "kenburns" else None,
-        "zoom_max": args.zoom_max if args.motion == "kenburns" else None,
+        "zoom_max": args.zoom_max if args.motion in {"kenburns", "reveal"} else None,
+        "no_pan": args.no_pan if args.motion == "kenburns" else None,
+        "zoom_direction": args.zoom_direction if args.motion in {"kenburns", "reveal"} else None,
+        "fit_zoom": args.fit_zoom if args.motion == "fit" else None,
+        "fit_pan": args.fit_pan if args.motion == "fit" else None,
         "encoder": encoder,
         "gpu": args.gpu if encoder == "h264_nvenc" else None,
         "audio_paths": [str(path) for path in audio_paths],

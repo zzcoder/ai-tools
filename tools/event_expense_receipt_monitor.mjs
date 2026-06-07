@@ -7,6 +7,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -15,9 +16,12 @@ import {
 import { tmpdir } from "node:os";
 import { appendFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const CROSS_OUT_DETECTOR = path.join(SCRIPT_DIR, "detect_receipt_crossouts.py");
 
 function envValue(name, legacyName, fallback = "") {
   return process.env[name] ?? (legacyName ? process.env[legacyName] : undefined) ?? fallback;
@@ -119,6 +123,11 @@ const CONFIG = {
   sheetRange: envValue("EVENT_EXPENSE_RECEIPTS_RANGE", "LAKE_ANNA_RECEIPTS_RANGE", "Receipts!A:M"),
   replyEnabled: envFlag("EVENT_EXPENSE_REPLY_ENABLED", "LAKE_ANNA_REPLY_ENABLED", true),
   ocrEnabled: envFlag("EVENT_EXPENSE_OCR_ENABLED", "LAKE_ANNA_OCR_ENABLED", true),
+  crossOutDetectionEnabled: envFlag(
+    "EVENT_EXPENSE_CROSS_OUT_DETECTION_ENABLED",
+    "LAKE_ANNA_CROSS_OUT_DETECTION_ENABLED",
+    true,
+  ),
   shareUploadedReceipts: envFlag("EVENT_EXPENSE_SHARE_RECEIPTS", "LAKE_ANNA_SHARE_RECEIPTS", true),
   bodyModelProvider: envValue("EVENT_EXPENSE_BODY_MODEL_PROVIDER", "LAKE_ANNA_BODY_MODEL_PROVIDER", ""),
   bodyModel: envValue("EVENT_EXPENSE_BODY_MODEL", "LAKE_ANNA_BODY_MODEL", ""),
@@ -1152,11 +1161,16 @@ function buildRow({
   attachment,
   driveFile,
   receiptTotal = null,
+  receiptTotals = null,
   notes = `Uploaded by ${CONFIG.workflowName} workflow`,
 }) {
-  const totalNote = receiptTotal
-    ? `OCR total $${receiptTotal.amount.toFixed(2)} from "${receiptTotal.label}"`
+  const totals = normalizeReceiptTotals(receiptTotal, receiptTotals);
+  const totalNote = totals.length > 1
+    ? `OCR totals ${totals.map((total) => formatMoney(total.amount)).join(", ")}`
+    : totals[0]
+    ? `OCR total ${formatMoney(totals[0].amount)} from "${totals[0].label}"`
     : "";
+  const totalAmount = totals.reduce((sum, total) => sum + total.amount, 0);
   return [
     new Date().toISOString(),
     isoEmailDate(message, headers.get("date")),
@@ -1170,7 +1184,7 @@ function buildRow({
     String(attachment.size || ""),
     "",
     [notes, totalNote].filter(Boolean).join("; "),
-    receiptTotal ? receiptTotal.amount.toFixed(2) : "",
+    totals.length ? totalAmount.toFixed(2) : "",
   ];
 }
 
@@ -1229,6 +1243,12 @@ function normalizeAmount(raw) {
   return Math.round(amount * 100) / 100;
 }
 
+function formatMoney(amount) {
+  const value = Number(amount);
+  if (!Number.isFinite(value)) return "$0.00";
+  return `${value < 0 ? "-" : ""}$${Math.abs(value).toFixed(2)}`;
+}
+
 function amountMatches(line) {
   return [
     ...String(line || "").matchAll(
@@ -1241,8 +1261,15 @@ function amountMatches(line) {
 
 function totalKeywordScore(line) {
   const lower = String(line || "").toLowerCase();
-  if (/\b(?:sub\s*total|subtotal|sales tax|tax|savings|change|discount|coupon)\b/.test(lower)) {
+  if (/\b(?:sub\s*total|subtotal|sales tax|tax|saving|savings|change|discount|coupon)\b/.test(lower)) {
     return 0;
+  }
+  if (
+    /\b(?:refund(?:ed)?|refund\s+total|total\s+refund|refund\s+amount|amount\s+refunded|refund\s+due|return\s+total|total\s+return|credit\s+memo|credit\s+due|store\s+credit)\b/.test(
+      lower,
+    )
+  ) {
+    return 100;
   }
   if (/\b(?:grand\s+total|total\s+due|amount\s+due|balance\s+due|total\s+amount)\b/.test(lower)) {
     return 100;
@@ -1252,7 +1279,7 @@ function totalKeywordScore(line) {
   return 0;
 }
 
-function extractReceiptTotal(text) {
+function receiptTotalCandidates(text) {
   const lines = String(text || "")
     .split(/\n+/)
     .map((line) => line.replace(/\s+/g, " ").trim())
@@ -1280,8 +1307,101 @@ function extractReceiptTotal(text) {
     }
   }
 
-  candidates.sort((left, right) => right.score - left.score || right.index - left.index);
-  return candidates[0] || null;
+  return { lines, candidates };
+}
+
+function lineIndicatesNegativeAmount(line) {
+  const text = String(line || "");
+  const amountPattern = String.raw`(?:US\$|\$)?\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.\d{2})|[0-9]+(?:\.\d{2})`;
+  return (
+    new RegExp(String.raw`(?:^|\s)-\s*(?:${amountPattern})\b`).test(text) ||
+    new RegExp(String.raw`(?:^|\s)(?:US\$|\$)\s*-\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.\d{2})\b`).test(text) ||
+    new RegExp(String.raw`\(\s*(?:${amountPattern})\s*\)`).test(text) ||
+    new RegExp(String.raw`(?:${amountPattern})\s*-\s*$`).test(text)
+  );
+}
+
+function receiptTextIndicatesRefund(text) {
+  const lines = receiptTextLines(text).map((line) => line.toLowerCase());
+  let score = 0;
+
+  for (const [index, line] of lines.entries()) {
+    if (!line || /\b(?:return|refund)\s+policy\b/.test(line)) continue;
+    if (/\breturns?\b.*\b(?:accepted|within|exchange|days|by|before|after)\b/.test(line)) {
+      continue;
+    }
+    if (/\b(?:refund(?:ed)?|refund\s+total|total\s+refund|refund\s+amount|amount\s+refunded|refund\s+due|customer\s+refund)\b/.test(line)) {
+      score += 3;
+    }
+    if (/\b(?:return\s+total|total\s+return|merchandise\s+return|return\s+receipt|return\s+transaction)\b/.test(line)) {
+      score += 3;
+    }
+    if (/\b(?:credit\s+memo|credit\s+due|store\s+credit)\b/.test(line)) {
+      score += 2;
+    }
+    if (index < 12 && /^(?:refund|return|returns?)\b/.test(line) && !/\bpolicy\b/.test(line)) {
+      score += 2;
+    }
+  }
+
+  return score >= 2;
+}
+
+function totalLineIndicatesRefund(total) {
+  const text = `${total?.label || ""}\n${total?.line || ""}`;
+  return receiptTextIndicatesRefund(text);
+}
+
+function applyRefundSignToTotals(totals, text) {
+  const wholeReceiptRefund = totals.length === 1 && receiptTextIndicatesRefund(text);
+  return totals.map((total) => {
+    const isRefund =
+      total.isRefund ||
+      lineIndicatesNegativeAmount(total.line) ||
+      totalLineIndicatesRefund(total) ||
+      wholeReceiptRefund;
+    if (!isRefund) return total;
+    return {
+      ...total,
+      amount: -Math.abs(total.amount),
+      isRefund: true,
+    };
+  });
+}
+
+function extractReceiptTotals(text) {
+  const { lines, candidates } = receiptTotalCandidates(text);
+  const selected = [];
+
+  for (const candidate of [...candidates].sort(
+    (left, right) => right.score - left.score || left.index - right.index,
+  )) {
+    const isDuplicate = selected.some(
+      (existing) =>
+        existing.amount === candidate.amount &&
+        Math.abs(existing.index - candidate.index) <= 6,
+    );
+    if (!isDuplicate) selected.push(candidate);
+  }
+
+  const totals = selected
+    .sort((left, right) => left.index - right.index)
+    .map((candidate, index, all) => {
+      const contextStart = Math.max(0, candidate.index - 24);
+      const contextEnd = Math.min(lines.length, candidate.index + 8);
+      return {
+        ...candidate,
+        receiptIndex: index + 1,
+        receiptCount: all.length,
+        contextText: lines.slice(contextStart, contextEnd).join("\n"),
+      };
+    });
+  return applyRefundSignToTotals(totals, text);
+}
+
+function extractReceiptTotal(text) {
+  const totals = extractReceiptTotals(text);
+  return [...totals].sort((left, right) => right.score - left.score || right.index - left.index)[0] || null;
 }
 
 function receiptTextLines(text) {
@@ -1289,6 +1409,276 @@ function receiptTextLines(text) {
     .split(/\n+/)
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter(Boolean);
+}
+
+const CROSS_OUT_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png"]);
+
+function receiptFileLooksPdf(localPath, attachment) {
+  const extension = path.extname(attachment?.filename || localPath).toLowerCase();
+  const mimeType = String(attachment?.mimeType || "").toLowerCase();
+  return extension === ".pdf" || mimeType === "application/pdf";
+}
+
+function receiptFileLooksSupportedImage(localPath, attachment) {
+  const extension = path.extname(attachment?.filename || localPath).toLowerCase();
+  const mimeType = String(attachment?.mimeType || "").toLowerCase();
+  return CROSS_OUT_IMAGE_EXTENSIONS.has(extension) || ["image/jpeg", "image/png"].includes(mimeType);
+}
+
+function receiptFileLooksHeic(localPath, attachment) {
+  const extension = path.extname(attachment?.filename || localPath).toLowerCase();
+  const mimeType = String(attachment?.mimeType || "").toLowerCase();
+  return [".heic", ".heif"].includes(extension) || ["image/heic", "image/heif"].includes(mimeType);
+}
+
+async function renderReceiptPagesForCrossOutDetection(localPath, attachment) {
+  if (receiptFileLooksPdf(localPath, attachment)) {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "event-expense-crossout-"));
+    const outputPrefix = path.join(tempDir, "page");
+    try {
+      await execFileAsync(
+        "pdftoppm",
+        ["-png", "-r", "180", "-f", "1", "-l", "3", localPath, outputPrefix],
+        { maxBuffer: 5 * 1024 * 1024 },
+      );
+      const imagePaths = readdirSync(tempDir)
+        .filter((name) => /^page-\d+\.png$/i.test(name))
+        .sort((left, right) => {
+          const leftNumber = Number(left.match(/\d+/)?.[0] || 0);
+          const rightNumber = Number(right.match(/\d+/)?.[0] || 0);
+          return leftNumber - rightNumber;
+        })
+        .map((name) => path.join(tempDir, name));
+      return { imagePaths, tempDir };
+    } catch (error) {
+      rmSync(tempDir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  if (receiptFileLooksSupportedImage(localPath, attachment)) {
+    return { imagePaths: [localPath], tempDir: "" };
+  }
+
+  if (receiptFileLooksHeic(localPath, attachment)) {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "event-expense-crossout-"));
+    const outputPath = path.join(tempDir, "page-1.png");
+    try {
+      await execFileAsync(
+        "ffmpeg",
+        ["-y", "-i", localPath, "-frames:v", "1", outputPath],
+        { maxBuffer: 5 * 1024 * 1024 },
+      );
+      return { imagePaths: [outputPath], tempDir };
+    } catch (error) {
+      rmSync(tempDir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  return { imagePaths: [], tempDir: "" };
+}
+
+function countDetectedCrossedOutLines(crossOutInfo) {
+  return Number(crossOutInfo?.crossedLineCount || 0);
+}
+
+function crossOutInfoHasLines(crossOutInfo) {
+  return countDetectedCrossedOutLines(crossOutInfo) > 0;
+}
+
+function crossedOutGlobalLineRatios(crossOutInfo) {
+  const pages = Array.isArray(crossOutInfo?.pages) ? crossOutInfo.pages : [];
+  const totalTextLines = pages.reduce(
+    (sum, page) => sum + Math.max(0, Number(page?.textLineCount || 0)),
+    0,
+  );
+  if (!totalTextLines) return [];
+
+  const ratios = [];
+  let offset = 0;
+  for (const page of pages) {
+    const lineCount = Math.max(0, Number(page?.textLineCount || 0));
+    for (const index of page?.crossedLineIndexes || []) {
+      const lineIndex = Number(index);
+      if (!Number.isFinite(lineIndex) || lineIndex < 0 || lineIndex >= lineCount) continue;
+      ratios.push((offset + lineIndex) / Math.max(1, totalTextLines - 1));
+    }
+    offset += lineCount;
+  }
+
+  return [...new Set(ratios.map((ratio) => ratio.toFixed(4)))].map(Number);
+}
+
+function isOcrLineVisuallyCrossedOut(lineIndex, lineCount, crossOutInfo) {
+  const ratios = crossedOutGlobalLineRatios(crossOutInfo);
+  if (!ratios.length || lineCount <= 0) return false;
+
+  const lineRatio = lineIndex / Math.max(1, lineCount - 1);
+  const detectedLineCount = Math.max(1, Number(crossOutInfo?.textLineCount || 0));
+  const tolerance = Math.max(0.035, Math.min(0.12, 1.75 / Math.max(lineCount, detectedLineCount)));
+  return ratios.some((ratio) => Math.abs(ratio - lineRatio) <= tolerance);
+}
+
+function lineLooksTextuallyCrossedOut(line) {
+  const text = String(line || "");
+  return (
+    /[\u0335-\u0338]/.test(text) ||
+    /[a-z0-9]\s*[-=_~]{4,}\s*[a-z0-9]/i.test(text) ||
+    /(?:^|\s)[-=_~]{6,}(?:\s|$)/.test(text)
+  );
+}
+
+async function detectCrossedOutReceiptLines({ localPath, uploadName, attachment }) {
+  if (!CONFIG.crossOutDetectionEnabled) return null;
+
+  let rendered = null;
+  try {
+    rendered = await renderReceiptPagesForCrossOutDetection(localPath, attachment);
+    if (!rendered.imagePaths.length) return null;
+
+    const { stdout } = await execFileAsync(
+      "python3",
+      [CROSS_OUT_DETECTOR, "--json", ...rendered.imagePaths],
+      {
+        encoding: "utf8",
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 60_000,
+      },
+    );
+    const info = JSON.parse(stdout || "{}");
+    if (crossOutInfoHasLines(info)) {
+      await log(
+        `Detected ${countDetectedCrossedOutLines(info)} possible crossed-out receipt line(s) in ${attachment.filename || uploadName}.`,
+      );
+    }
+    return info;
+  } catch (error) {
+    await log(`Cross-out detection failed for ${attachment.filename || uploadName}: ${error.message}`);
+    return null;
+  } finally {
+    if (rendered?.tempDir) {
+      rmSync(rendered.tempDir, { recursive: true, force: true });
+    }
+  }
+}
+
+function lineItemAmountCandidate(line, { refundReceipt = false } = {}) {
+  const cleaned = String(line || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return null;
+
+  const lower = cleaned.toLowerCase();
+  const refundLineItemWords = refundReceipt ? "" : "|refund|return";
+  if (
+    new RegExp(
+      String.raw`\b(?:sub\s*total|subtotal|total|tax|savings?|saved|discount|coupon|change|balance|due|cash|tender|payment|paid|visa|mastercard|discover|amex|debit|credit|card|auth|approved|void${refundLineItemWords})\b`,
+    ).test(
+      lower,
+    )
+  ) {
+    return null;
+  }
+  if (/@\s*(?:US\$|\$)?\s*\d+(?:\.\d{2})?/i.test(cleaned)) return null;
+  if (/\b(?:each|ea\.?|per\s+(?:lb|lbs|kg|oz|item))\b/i.test(cleaned)) return null;
+
+  const match = cleaned.match(
+    /(?:US\$|\$)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d{2})|[0-9]+(?:\.\d{2}))\s*(?:[A-Z])?\s*$/,
+  );
+  if (!match) return null;
+  if (/[-−]\s*[A-Z]?\s*$/.test(cleaned)) return null;
+
+  const beforeAmount = cleaned.slice(0, match.index).trim();
+  if (!/[a-z]/i.test(beforeAmount)) return null;
+  if (/^(?:qty|quantity|price|amount|description|item)\b/i.test(beforeAmount)) return null;
+
+  const amount = normalizeAmount(match[1]);
+  if (amount === null) return null;
+  return { amount, line: cleaned };
+}
+
+function visibleLineItemMerchants(text) {
+  const raw = String(text || "");
+  const merchants = [];
+  const add = (name, pattern) => {
+    if (pattern.test(raw) && !merchants.includes(name)) merchants.push(name);
+  };
+
+  add("Costco", /\bcostco\b/i);
+  add("99 Ranch", /\b(?:99\s*ranch|99\s*store|ranch\s*market)\b/i);
+  add("Walmart", /\bwalmart\b/i);
+  add("Target", /\btarget\b/i);
+  add("ALDI", /\baldi\b/i);
+  add("Kroger", /\bkroger\b/i);
+  add("Food Lion", /\bfood\s+lion\b/i);
+  add("Publix", /\bpublix\b/i);
+  add("Safeway", /\bsafeway\b/i);
+  add("The Home Depot", /\bhome\s+depot\b/i);
+  add("Lowe's", /\blowe'?s\b/i);
+  add("Amazon", /\bamazon\b/i);
+  add("Instacart", /\binstacart\b/i);
+  if (/\blidl\b/i.test(raw) || /\blidi\b/i.test(raw) || /\b1idl\b/i.test(raw)) {
+    add("Lidl", /\b(?:lidl|lidi|1idl)\b/i);
+  }
+  return merchants;
+}
+
+function extractVisibleLineItemFallback(text, attachment, crossOutInfo = null) {
+  const lines = receiptTextLines(text);
+  const lineItems = [];
+  const skippedCrossedOutLines = [];
+  const isRefund = receiptTextIndicatesRefund(text);
+
+  for (const [lineIndex, line] of lines.entries()) {
+    const crossedOut =
+      isOcrLineVisuallyCrossedOut(lineIndex, lines.length, crossOutInfo) ||
+      lineLooksTextuallyCrossedOut(line);
+    const item = lineItemAmountCandidate(line, { refundReceipt: isRefund });
+    if (!item) continue;
+
+    if (crossedOut) {
+      skippedCrossedOutLines.push(item.line);
+      continue;
+    }
+
+    lineItems.push(item);
+  }
+
+  if (crossOutInfoHasLines(crossOutInfo) && !skippedCrossedOutLines.length) {
+    return {
+      needsReview: true,
+      source: "visible-line-items-crossout-review",
+      crossedOutLineCount: countDetectedCrossedOutLines(crossOutInfo),
+    };
+  }
+
+  if (!lineItems.length) return null;
+
+  const subtotal = Math.round(lineItems.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
+  if (!Number.isFinite(subtotal) || subtotal <= 0) return null;
+  const amount = isRefund ? -subtotal : subtotal;
+
+  const merchants = visibleLineItemMerchants(text);
+  const description =
+    merchants.length > 1
+      ? truncateReceiptExpenseLabel(merchants.join(" + "))
+      : extractReceiptDescription(text, attachment);
+
+  return {
+    amount,
+    label: "VISIBLE LINE ITEMS",
+    line: `${lineItems.length} visible line item(s) summed`,
+    score: 10,
+    index: 0,
+    receiptIndex: 1,
+    receiptCount: 1,
+    contextText: lineItems.map((item) => item.line).join("\n"),
+    description,
+    source: "visible-line-items",
+    isRefund,
+    lineItemCount: lineItems.length,
+    crossedOutLineCount: skippedCrossedOutLines.length,
+    crossedOutContextText: skippedCrossedOutLines.join("\n"),
+  };
 }
 
 function normalizeReceiptDescription(value) {
@@ -1334,6 +1724,7 @@ function knownReceiptMerchant(text) {
     ["Food Lion", /\bfood\s+lion\b/i],
     ["Publix", /\bpublix\b/i],
     ["Safeway", /\bsafeway\b/i],
+    ["99 Ranch", /\b(?:99\s*ranch|99\s*store|ranch\s*market)\b/i],
     ["The Home Depot", /\bhome\s+depot\b/i],
     ["Lowe's", /\blowe'?s\b/i],
     ["Amazon", /\bamazon\b/i],
@@ -1533,8 +1924,8 @@ async function extractTextWithDriveOcr(localPath, uploadName) {
   }
 }
 
-async function detectReceiptTotal({ localPath, uploadName, attachment }) {
-  if (!CONFIG.ocrEnabled) return null;
+async function detectReceiptTotals({ localPath, uploadName, attachment }) {
+  if (!CONFIG.ocrEnabled) return [];
 
   const extension = path.extname(attachment.filename || uploadName).toLowerCase();
   const mimeType = String(attachment.mimeType || "").toLowerCase();
@@ -1545,21 +1936,59 @@ async function detectReceiptTotal({ localPath, uploadName, attachment }) {
     if (pdfText.trim()) textParts.push(pdfText);
   }
 
-  let total = extractReceiptTotal(textParts.join("\n"));
-  if (!total) {
+  let totals = extractReceiptTotals(textParts.join("\n"));
+  if (!totals.length) {
     const ocrText = await extractTextWithDriveOcr(localPath, uploadName);
     if (ocrText.trim()) textParts.push(ocrText);
-    total = extractReceiptTotal(textParts.join("\n"));
+    totals = extractReceiptTotals(textParts.join("\n"));
   }
 
   const combinedText = textParts.join("\n");
-  if (total) {
-    total.description = extractReceiptDescription(combinedText, attachment);
-    await log(
-      `Detected receipt total $${total.amount.toFixed(2)} in ${attachment.filename} from "${total.label}" for "${total.description}"`,
-    );
+  if (!totals.length) {
+    const fallbackText = textParts[textParts.length - 1] || combinedText;
+    const crossOutInfo = await detectCrossedOutReceiptLines({ localPath, uploadName, attachment });
+    const visibleLineItemTotal = extractVisibleLineItemFallback(fallbackText, attachment, crossOutInfo);
+    if (visibleLineItemTotal?.needsReview) {
+      await log(
+        `No receipt total found in ${attachment.filename}; ${visibleLineItemTotal.crossedOutLineCount} possible crossed-out line(s) could not be aligned to OCR line items, so the expense row will require manual review.`,
+      );
+    } else if (visibleLineItemTotal) {
+      totals = [visibleLineItemTotal];
+      const crossedOutNote = visibleLineItemTotal.crossedOutLineCount
+        ? ` and ignored ${visibleLineItemTotal.crossedOutLineCount} crossed-out line item(s)`
+        : "";
+      await log(
+        `No receipt total found in ${attachment.filename}; summed ${visibleLineItemTotal.lineItemCount} visible line item(s)${crossedOutNote} to ${formatMoney(visibleLineItemTotal.amount)}.`,
+      );
+    }
   }
-  return total;
+
+  totals = totals.map((total) => ({
+    ...total,
+    description: total.description || extractReceiptDescription(total.contextText || combinedText, attachment),
+  }));
+
+  for (const total of totals) {
+    const indexNote = totals.length > 1 ? ` (${total.receiptIndex}/${totals.length})` : "";
+    if (total.source === "visible-line-items") {
+      const crossedOutNote = total.crossedOutLineCount
+        ? `, ignored ${total.crossedOutLineCount} crossed-out line item(s)`
+        : "";
+      await log(
+        `Detected visible line-item fallback${indexNote} ${formatMoney(total.amount)} in ${attachment.filename}${crossedOutNote} for "${total.description}"`,
+      );
+    } else {
+      await log(
+        `Detected receipt total${indexNote} ${formatMoney(total.amount)} in ${attachment.filename} from "${total.label}" for "${total.description}"`,
+      );
+    }
+  }
+  return totals;
+}
+
+async function detectReceiptTotal({ localPath, uploadName, attachment }) {
+  const totals = await detectReceiptTotals({ localPath, uploadName, attachment });
+  return totals[0] || null;
 }
 
 function typedAmountOperation(line, amountIndex = 0) {
@@ -1938,8 +2367,14 @@ function combineReceiptAdjustments(typedAmounts) {
 
 function selectTypedAmountForReceipt(typedAmounts, attachmentIndex, attachmentCount) {
   if (!typedAmounts.length) return null;
-  if (attachmentCount > 1 && typedAmounts[attachmentIndex]) {
-    return typedAmounts[attachmentIndex];
+  if (attachmentCount > 1) {
+    // Multiple receipt attachments need a clear one-to-one body amount mapping.
+    // A single body "total" is usually the combined email total, not the amount
+    // for every receipt, so let each attachment use its own OCR total instead.
+    if (typedAmounts.length === attachmentCount && typedAmounts[attachmentIndex]) {
+      return typedAmounts[attachmentIndex];
+    }
+    return null;
   }
   return (
     typedAmounts.find((entry) => entry.operation === "override") ||
@@ -1948,33 +2383,59 @@ function selectTypedAmountForReceipt(typedAmounts, attachmentIndex, attachmentCo
   );
 }
 
+function hasAmbiguousTypedAmountsForMultipleReceipts(typedAmounts, attachmentCount) {
+  return attachmentCount > 1 && typedAmounts.length > 0 && typedAmounts.length !== attachmentCount;
+}
+
 function resolveReceiptExpenseAmount(receiptTotal, typedAmountOverride) {
+  const receiptSign = receiptTotal?.amount < 0 ? -1 : 1;
   if (!typedAmountOverride) {
-    return receiptTotal ? { amount: receiptTotal.amount, source: "receipt-ocr", note: "" } : null;
+    return receiptTotal
+      ? {
+          amount: receiptTotal.amount,
+          source: receiptTotal.isRefund
+            ? receiptTotal.source === "visible-line-items"
+              ? "visible-line-items-refund"
+              : "receipt-refund"
+            : receiptTotal.source === "visible-line-items"
+              ? "visible-line-items"
+              : "receipt-ocr",
+          note: "",
+        }
+      : null;
   }
 
   if (typedAmountOverride.operation === "subtract") {
     if (!receiptTotal) return null;
+    const adjustedAmount =
+      receiptSign *
+      Math.max(0, Math.round((Math.abs(receiptTotal.amount) - typedAmountOverride.amount) * 100) / 100);
     return {
-      amount: Math.max(0, Math.round((receiptTotal.amount - typedAmountOverride.amount) * 100) / 100),
+      amount: adjustedAmount,
       source: "email-body-adjustment",
-      note: `Email body adjustment: -$${typedAmountOverride.amount.toFixed(2)}`,
+      note: `Email body adjustment: -${formatMoney(typedAmountOverride.amount)}`,
     };
   }
 
   if (typedAmountOverride.operation === "add") {
     if (!receiptTotal) return null;
+    const adjustedAmount =
+      receiptSign *
+      Math.round((Math.abs(receiptTotal.amount) + typedAmountOverride.amount) * 100) / 100;
     return {
-      amount: Math.round((receiptTotal.amount + typedAmountOverride.amount) * 100) / 100,
+      amount: adjustedAmount,
       source: "email-body-adjustment",
-      note: `Email body adjustment: +$${typedAmountOverride.amount.toFixed(2)}`,
+      note: `Email body adjustment: +${formatMoney(typedAmountOverride.amount)}`,
     };
   }
 
+  const overrideAmount = receiptTotal?.isRefund
+    ? -Math.abs(typedAmountOverride.amount)
+    : typedAmountOverride.amount;
   return {
-    amount: typedAmountOverride.amount,
-    source: "email-body",
-    note: `Email body amount: $${typedAmountOverride.amount.toFixed(2)}`,
+    amount: overrideAmount,
+    source: receiptTotal?.isRefund ? "email-body-refund" : "email-body",
+    note: `Email body amount: ${formatMoney(overrideAmount)}`,
   };
 }
 
@@ -2039,6 +2500,8 @@ function buildReceiptExpenseRow({
   receiptTotal,
   typedAmountOverride = null,
   receiptLink,
+  receiptIndex = 1,
+  receiptCount = 1,
 }) {
   const resolvedAmount = resolveReceiptExpenseAmount(receiptTotal, typedAmountOverride);
   const amount = resolvedAmount.amount;
@@ -2047,6 +2510,9 @@ function buildReceiptExpenseRow({
     `Subject: ${headers.get("subject")}`,
     `Message ID: ${message.id}`,
   ];
+  if (receiptCount > 1) {
+    commentParts.push(`Receipt ${receiptIndex} of ${receiptCount} detected inside ${attachment.filename}`);
+  }
   if (typedAmountOverride) {
     commentParts.push(resolvedAmount.note);
     commentParts.push(`Excerpt: ${typedAmountOverride.excerpt}`);
@@ -2054,12 +2520,23 @@ function buildReceiptExpenseRow({
       commentParts.push(`Body parsed by model: ${typedAmountOverride.model || CONFIG.bodyModel}`);
     }
     if (receiptTotal && typedAmountOverride.operation === "override") {
-      commentParts.push(`OCR total ignored: $${receiptTotal.amount.toFixed(2)} from ${receiptTotal.label}`);
+      commentParts.push(`OCR total ignored: ${formatMoney(receiptTotal.amount)} from ${receiptTotal.label}`);
     } else if (receiptTotal) {
-      commentParts.push(`OCR total: $${receiptTotal.amount.toFixed(2)} from ${receiptTotal.label}`);
+      commentParts.push(`OCR total: ${formatMoney(receiptTotal.amount)} from ${receiptTotal.label}`);
     }
+  } else if (receiptTotal?.source === "visible-line-items") {
+    const visibleLineComment =
+      `No OCR total detected; summed ${receiptTotal.lineItemCount || "visible"} line item(s) visible in receipt`;
+    commentParts.push(
+      receiptTotal.crossedOutLineCount
+        ? `${visibleLineComment}; ignored ${receiptTotal.crossedOutLineCount} crossed-out line item(s)`
+        : visibleLineComment,
+    );
   } else if (receiptTotal) {
     commentParts.push(`OCR label: ${receiptTotal.label}`);
+  }
+  if (receiptTotal?.isRefund) {
+    commentParts.push("Refund/return receipt recorded as a negative amount");
   }
   if (receiptTotal?.description) commentParts.push(`OCR item: ${receiptTotal.description}`);
 
@@ -2072,6 +2549,37 @@ function buildReceiptExpenseRow({
   ];
 }
 
+function buildReceiptReviewExpenseRow({
+  message,
+  headers,
+  attachment,
+  typedAmountOverride = null,
+  receiptLink,
+}) {
+  const commentParts = [
+    `Subject: ${headers.get("subject")}`,
+    `Message ID: ${message.id}`,
+    `Attachment: ${attachment.filename}`,
+    "No OCR total detected; enter the expense amount manually.",
+  ];
+  if (typedAmountOverride) {
+    commentParts.push(`Body amount could not be applied without a receipt total: ${typedAmountDisplay(typedAmountOverride)}`);
+    commentParts.push(`Excerpt: ${typedAmountOverride.excerpt}`);
+  }
+
+  return [
+    sanitizeFilename(attachment.filename || "Receipt"),
+    "",
+    payerFromHeader(headers.get("from")),
+    receiptLink || "",
+    commentParts.join("; "),
+  ];
+}
+
+function receiptExpenseEntryCompletes(entry) {
+  return entry?.status === "processed" || entry?.status === "needs-review";
+}
+
 async function processReceiptExpense({
   args,
   state,
@@ -2082,10 +2590,12 @@ async function processReceiptExpense({
   receiptTotal,
   typedAmountOverride = null,
   receiptLink,
+  receiptIndex = 1,
+  receiptCount = 1,
 }) {
   const resolvedAmount = resolveReceiptExpenseAmount(receiptTotal, typedAmountOverride);
   if (!resolvedAmount) return "no-total";
-  if (state.receiptExpenses?.[key]?.status === "processed") return "already-processed";
+  if (receiptExpenseEntryCompletes(state.receiptExpenses?.[key])) return "already-processed";
 
   const row = buildReceiptExpenseRow({
     message,
@@ -2094,6 +2604,8 @@ async function processReceiptExpense({
     receiptTotal,
     typedAmountOverride,
     receiptLink,
+    receiptIndex,
+    receiptCount,
   });
   const amount = resolvedAmount.amount;
 
@@ -2118,11 +2630,155 @@ async function processReceiptExpense({
     bodyModel: typedAmountOverride?.model || "",
     label: receiptTotal?.label || "",
     description: receiptTotal?.description || "",
+    receiptIndex,
+    receiptCount,
     receiptLink,
     row,
   };
   writeState(state);
   return "processed";
+}
+
+async function processReceiptExpenseReview({
+  args,
+  state,
+  key,
+  message,
+  headers,
+  attachment,
+  typedAmountOverride = null,
+  receiptLink,
+}) {
+  if (receiptExpenseEntryCompletes(state.receiptExpenses?.[key])) return "already-processed";
+
+  const row = buildReceiptReviewExpenseRow({
+    message,
+    headers,
+    attachment,
+    typedAmountOverride,
+    receiptLink,
+  });
+
+  if (args.dryRun) {
+    await log(`Would append manual-review expense row for ${attachment.filename}`);
+    return "dry-run";
+  }
+
+  await appendSummaryRow(row);
+  state.receiptExpenses[key] = {
+    status: "needs-review",
+    processedAt: new Date().toISOString(),
+    messageId: message.id,
+    attachmentName: attachment.filename,
+    amount: null,
+    amountSource: "manual-review",
+    typedAmountExcerpt: typedAmountOverride?.excerpt || "",
+    typedAmountOperation: typedAmountOverride?.operation || "",
+    typedAmountSource: typedAmountOverride?.source || "",
+    bodyModel: typedAmountOverride?.model || "",
+    label: "",
+    description: sanitizeFilename(attachment.filename || "Receipt"),
+    receiptIndex: 1,
+    receiptCount: 1,
+    receiptLink,
+    row,
+  };
+  writeState(state);
+  return "needs-review";
+}
+
+function summarizeReceiptExpenseStatuses(statuses) {
+  const rowCount = statuses.filter((status) =>
+    ["processed", "dry-run", "needs-review"].includes(status),
+  ).length;
+  if (rowCount) {
+    return {
+      status: statuses.includes("processed")
+        ? "processed"
+        : statuses.includes("needs-review")
+          ? "needs-review"
+          : "dry-run",
+      rowCount,
+    };
+  }
+  if (!statuses.length || statuses.every((status) => status === "no-total")) {
+    return { status: "no-total", rowCount: 0 };
+  }
+  if (statuses.every((status) => status === "already-processed")) {
+    return { status: "already-processed", rowCount: 0 };
+  }
+  return { status: statuses[0] || "no-total", rowCount: 0 };
+}
+
+async function processReceiptExpenses({
+  args,
+  state,
+  key,
+  message,
+  headers,
+  attachment,
+  receiptTotals,
+  typedAmountOverride = null,
+  receiptLink,
+}) {
+  const totals = normalizeReceiptTotals(null, receiptTotals);
+  if (!totals.length) {
+    if (!typedAmountOverride || typedAmountOverride.operation !== "override") {
+      const status = await processReceiptExpenseReview({
+        args,
+        state,
+        key: receiptExpenseKey(key),
+        message,
+        headers,
+        attachment,
+        typedAmountOverride,
+        receiptLink,
+      });
+      return summarizeReceiptExpenseStatuses([status]);
+    }
+
+    const status = await processReceiptExpense({
+      args,
+      state,
+      key: receiptExpenseKey(key),
+      message,
+      headers,
+      attachment,
+      receiptTotal: null,
+      typedAmountOverride,
+      receiptLink,
+    });
+    return summarizeReceiptExpenseStatuses([status]);
+  }
+
+  let amountOverride = typedAmountOverride;
+  if (totals.length > 1 && amountOverride) {
+    await log(
+      `Ignoring ambiguous body amount ${typedAmountDisplay(amountOverride)} for ${attachment.filename}; ` +
+        `${totals.length} receipt totals were detected inside one attachment.`,
+    );
+    amountOverride = null;
+  }
+
+  const statuses = [];
+  for (const [index, receiptTotal] of totals.entries()) {
+    statuses.push(
+      await processReceiptExpense({
+        args,
+        state,
+        key: receiptExpenseKeyForTotal(key, index, totals.length),
+        message,
+        headers,
+        attachment,
+        receiptTotal,
+        typedAmountOverride: totals.length === 1 ? amountOverride : null,
+        receiptLink,
+        receiptIndex: index + 1,
+        receiptCount: totals.length,
+      }),
+    );
+  }
+  return summarizeReceiptExpenseStatuses(statuses);
 }
 
 function normalizeSummaryRow(row, fallbackComment) {
@@ -2171,6 +2827,18 @@ function receiptExpenseKey(key) {
   return `${key}:expense`;
 }
 
+function normalizeReceiptTotals(receiptTotal, receiptTotals) {
+  if (Array.isArray(receiptTotals) && receiptTotals.length) {
+    return receiptTotals.filter(Boolean);
+  }
+  return receiptTotal ? [receiptTotal] : [];
+}
+
+function receiptExpenseKeyForTotal(key, totalIndex, totalCount) {
+  const baseKey = receiptExpenseKey(key);
+  return totalCount > 1 ? `${baseKey}:receipt-${totalIndex + 1}` : baseKey;
+}
+
 function skippedAsNoOp(state, messageId) {
   const reason = String(state.skippedMessages?.[messageId]?.reason || "");
   return /no pdf\/image receipt attachment or typed amount|workflow account|workflow marker|message was sent/i.test(
@@ -2183,8 +2851,18 @@ function attachmentAlreadyProcessed(state, message, attachment) {
   const existingAttachment = findExistingAttachment(state, key, message, attachment);
   const existing = existingAttachment.value;
   if (existing?.status !== "processed") return false;
-  const expense = state.receiptExpenses?.[receiptExpenseKey(existingAttachment.key)];
-  return !existing.receiptTotal || expense?.status === "processed";
+  const totals = normalizeReceiptTotals(existing.receiptTotal || null, existing.receiptTotals || null);
+  if (!totals.length) {
+    return receiptExpenseEntryCompletes(
+      state.receiptExpenses?.[receiptExpenseKey(existingAttachment.key)],
+    );
+  }
+  return totals.every((_total, index) => {
+    const expense = state.receiptExpenses?.[
+      receiptExpenseKeyForTotal(existingAttachment.key, index, totals.length)
+    ];
+    return receiptExpenseEntryCompletes(expense);
+  });
 }
 
 function messageAlreadyComplete(state, message, attachments) {
@@ -2473,37 +3151,44 @@ async function processAttachment({
     writeState(state);
   }
   if (existing?.status === "processed") {
-    const existingReceiptTotal = existing.receiptTotal || null;
-    const expenseStatus = await processReceiptExpense({
+    const existingReceiptTotals = normalizeReceiptTotals(
+      existing.receiptTotal || null,
+      existing.receiptTotals || null,
+    );
+    const expenseResult = await processReceiptExpenses({
       args,
       state,
-      key: receiptExpenseKey(key),
+      key,
       message,
       headers,
       attachment,
-      receiptTotal: existingReceiptTotal,
+      receiptTotals: existingReceiptTotals,
       typedAmountOverride,
       receiptLink: existing?.driveFile?.webViewLink || existing?.row?.[7] || "",
     });
     return {
       status: "already-processed",
       link: existing?.driveFile?.webViewLink || existing?.row?.[7] || "",
-      expenseStatus,
+      expenseStatus: expenseResult.status,
+      expenseRows: expenseResult.rowCount,
     };
   }
 
   if (existing?.status === "uploaded" && existing.row) {
-    let expenseStatus = "no-total";
+    let expenseResult = { status: "no-total", rowCount: 0 };
     if (!args.dryRun) {
       await appendReceiptRow(existing.row);
-      expenseStatus = await processReceiptExpense({
+      expenseResult = await processReceiptExpenses({
         args,
         state,
-        key: receiptExpenseKey(key),
+        key,
         message,
         headers,
         attachment,
-        receiptTotal: existing.receiptTotal || null,
+        receiptTotals: normalizeReceiptTotals(
+          existing.receiptTotal || null,
+          existing.receiptTotals || null,
+        ),
         typedAmountOverride,
         receiptLink: existing?.driveFile?.webViewLink || existing?.row?.[7] || "",
       });
@@ -2517,7 +3202,8 @@ async function processAttachment({
     return {
       status: "row-appended",
       link: existing?.driveFile?.webViewLink || existing?.row?.[7] || "",
-      expenseStatus,
+      expenseStatus: expenseResult.status,
+      expenseRows: expenseResult.rowCount,
     };
   }
 
@@ -2535,9 +3221,10 @@ async function processAttachment({
 
   const localPath = await downloadAttachment(message.id, attachment, uploadName);
   statSync(localPath);
-  const receiptTotal = await detectReceiptTotal({ localPath, uploadName, attachment });
+  const receiptTotals = await detectReceiptTotals({ localPath, uploadName, attachment });
+  const receiptTotal = receiptTotals[0] || null;
   const driveFile = await uploadToDrive(localPath, uploadName);
-  const row = buildRow({ message, headers, attachment, driveFile, receiptTotal });
+  const row = buildRow({ message, headers, attachment, driveFile, receiptTotal, receiptTotals });
 
   state.attachments[key] = {
     status: "uploaded",
@@ -2548,20 +3235,21 @@ async function processAttachment({
     mimeType: attachment.mimeType,
     size: attachment.size,
     receiptTotal,
+    receiptTotals,
     driveFile,
     row,
   };
   writeState(state);
 
   await appendReceiptRow(row);
-  const expenseStatus = await processReceiptExpense({
+  const expenseResult = await processReceiptExpenses({
     args,
     state,
-    key: receiptExpenseKey(key),
+    key,
     message,
     headers,
     attachment,
-    receiptTotal,
+    receiptTotals,
     typedAmountOverride,
     receiptLink: driveFile.webViewLink || "",
   });
@@ -2574,7 +3262,8 @@ async function processAttachment({
   return {
     status: "processed",
     link: driveFile.webViewLink || "",
-    expenseStatus,
+    expenseStatus: expenseResult.status,
+    expenseRows: expenseResult.rowCount,
   };
 }
 
@@ -2697,6 +3386,10 @@ async function runMonitor(args) {
     }
 
     const typedAmountIndexesUsedByReceipts = new Set();
+    const ambiguousTypedAmountsForReceipts = hasAmbiguousTypedAmountsForMultipleReceipts(
+      typedAmounts,
+      attachments.length,
+    );
     for (const [attachmentIndex, attachment] of attachments.entries()) {
       const typedAmountOverride = selectTypedAmountForReceipt(
         typedAmounts,
@@ -2704,7 +3397,11 @@ async function runMonitor(args) {
         attachments.length,
       );
       if (typedAmountOverride) {
-        typedAmounts.forEach((_entry, index) => typedAmountIndexesUsedByReceipts.add(index));
+        if (attachments.length > 1 && typedAmounts.length === attachments.length) {
+          typedAmountIndexesUsedByReceipts.add(attachmentIndex);
+        } else {
+          typedAmounts.forEach((_entry, index) => typedAmountIndexesUsedByReceipts.add(index));
+        }
       }
 
       const result = await processAttachment({
@@ -2717,9 +3414,7 @@ async function runMonitor(args) {
       });
       if (result.status === "processed" || result.status === "row-appended") processed += 1;
       else if (result.status !== "already-processed") skipped += 1;
-      if (result.expenseStatus === "processed" || result.expenseStatus === "dry-run") {
-        receiptExpenseRows += 1;
-      }
+      receiptExpenseRows += result.expenseRows || 0;
       if (result.link) {
         generatedReceipts.push({ webViewLink: result.link });
       }
@@ -2727,6 +3422,13 @@ async function runMonitor(args) {
 
     for (const [index, typedAmount] of typedAmounts.entries()) {
       if (typedAmountIndexesUsedByReceipts.has(index)) continue;
+      if (ambiguousTypedAmountsForReceipts) {
+        await log(
+          `Ignoring ambiguous body amount ${typedAmountDisplay(typedAmount)} for message ${message.id}; ` +
+            `${attachments.length} receipt attachments need OCR totals or one typed amount per receipt.`,
+        );
+        continue;
+      }
       const typedReceiptLink = generatedReceipts[0]?.webViewLink || "";
       const result = await processTypedAmount({
         args,

@@ -3,17 +3,38 @@
 The reusable program is:
 
 ```bash
-python3 tools/make_tree_planting_slideshow.py
+python3 tools/make_photo_slideshow.py
 ```
 
-It sorts photos by EXIF timestamp when available, falls back to file modified time, creates a title card, concatenates music, writes a timestamp order CSV, and renders MP4 through ffmpeg. Use `--encoder h264_nvenc --gpu 1` to render with the NVIDIA GPU.
+It sorts photos by EXIF timestamp when available, falls back to file modified time, creates an optional title card, concatenates music, writes a timestamp order CSV, and renders MP4 through ffmpeg. Use `--encoder h264_nvenc --gpu 1` to render with the NVIDIA GPU.
 
-## Earth Day 2026 Smooth Preview
+## Basic Use
+
+```bash
+python3 tools/make_photo_slideshow.py \
+  --image-dir /path/to/photos \
+  --audio-list /path/to/songs.txt \
+  --title "Trip Slideshow" \
+  --motion reveal \
+  --transition-duration 0.75 \
+  --transition-style dip-black \
+  --fps 30 \
+  --width 1920 \
+  --height 1080 \
+  --output /path/to/slideshow.mp4 \
+  --build-dir /path/to/slideshow-build \
+  --encoder h264_nvenc \
+  --gpu 1
+```
+
+For a silent slideshow, omit audio and pass `--duration 60`.
+
+## Smooth Preview
 
 This is the smooth full-image mode. It keeps the whole photo visible and uses 30 fps panning without zoom resizing.
 
 ```bash
-python3 tools/make_tree_planting_slideshow.py \
+python3 tools/make_photo_slideshow.py \
   --image-dir /home/zhihongz/codex-workspace/tree-planting \
   --audio-list tools/earth_day_2026_audio.txt \
   --title "Earth Day Volunteering 2026" \
@@ -32,7 +53,7 @@ python3 tools/make_tree_planting_slideshow.py \
 Use this before a full render:
 
 ```bash
-python3 tools/make_tree_planting_slideshow.py \
+python3 tools/make_photo_slideshow.py \
   --image-dir /home/zhihongz/codex-workspace/tree-planting \
   --audio-list tools/earth_day_2026_audio.txt \
   --title "Earth Day Volunteering 2026" \
@@ -49,7 +70,7 @@ python3 tools/make_tree_planting_slideshow.py \
 ## 4K Render
 
 ```bash
-python3 tools/make_tree_planting_slideshow.py \
+python3 tools/make_photo_slideshow.py \
   --image-dir /home/zhihongz/codex-workspace/tree-planting \
   --audio-list tools/earth_day_2026_audio.txt \
   --title "Earth Day Volunteering 2026" \
