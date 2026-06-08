@@ -9,6 +9,7 @@ Examples:
 
     python3 tools/geolocate.py hike.gpx ./photos --dry-run
     python3 tools/geolocate.py hike.kml ./photos --photo-timezone America/New_York
+    python3 tools/geolocate.py hike.gpx ./photos --photo-time-diff +1:00:00
     python3 tools/geolocate.py hike.gpx ./photos --overwrite-original
 
 ExifTool is required for metadata reading and writing:
@@ -24,6 +25,7 @@ import bisect
 import csv
 import json
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -143,6 +145,86 @@ def parse_exif_datetime(
         except ValueError:
             continue
     return None
+
+
+def parse_time_delta_seconds(value: str) -> float:
+    """Parse user-facing time deltas such as +1:30:00, -45m, or 3600."""
+    text = str(value).strip().lower()
+    if not text:
+        raise argparse.ArgumentTypeError("time difference cannot be empty")
+
+    sign = 1.0
+    if text[0] in "+-":
+        if text[0] == "-":
+            sign = -1.0
+        text = text[1:].strip()
+    if not text:
+        raise argparse.ArgumentTypeError(f"invalid time difference: {value!r}")
+    text = re.sub(r"[\s,_]+", "", text)
+    if not text:
+        raise argparse.ArgumentTypeError(f"invalid time difference: {value!r}")
+
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) not in {2, 3}:
+            raise argparse.ArgumentTypeError(
+                "colon time differences must be HH:MM or HH:MM:SS"
+            )
+        try:
+            numbers = [float(part) for part in parts]
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid time difference: {value!r}") from exc
+        if len(numbers) == 2:
+            hours, minutes = numbers
+            seconds = 0.0
+        else:
+            hours, minutes, seconds = numbers
+        return sign * (hours * 3600 + minutes * 60 + seconds)
+
+    unit_pattern = (
+        r"(\d+(?:\.\d+)?)(hours|hour|hrs|hr|h|minutes|minute|mins|min|m|seconds|second|secs|sec|s)"
+    )
+    unit_matches = list(re.finditer(unit_pattern, text))
+    if unit_matches and "".join(match.group(0) for match in unit_matches) == text:
+        total = 0.0
+        for match in unit_matches:
+            amount = float(match.group(1))
+            unit = match.group(2)
+            if unit.startswith("h"):
+                total += amount * 3600
+            elif unit.startswith("m"):
+                total += amount * 60
+            else:
+                total += amount
+        return sign * total
+
+    try:
+        return sign * float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "time difference must be seconds, HH:MM[:SS], or unit form like 1h30m"
+        ) from exc
+
+
+def normalize_time_delta_args(argv: list[str]) -> list[str]:
+    """Allow `--photo-time-diff -30m` without requiring `--photo-time-diff=-30m`."""
+    normalized: list[str] = []
+    index = 0
+    time_delta_flags = {"--photo-time-diff", "--camera-time-offset"}
+    while index < len(argv):
+        arg = argv[index]
+        if (
+            arg in time_delta_flags
+            and index + 1 < len(argv)
+            and argv[index + 1].startswith("-")
+            and not argv[index + 1].startswith("--")
+        ):
+            normalized.append(f"{arg}={argv[index + 1]}")
+            index += 2
+            continue
+        normalized.append(arg)
+        index += 1
+    return normalized
 
 
 def parse_gpx(path: Path) -> list[TrackPoint]:
@@ -438,6 +520,7 @@ def process_photos(args: argparse.Namespace) -> list[PhotoResult]:
     track_points = parse_track(args.track)
     if not track_points:
         raise ValueError(f"No timestamped track points found in {args.track}")
+    photo_time_offset_seconds = args.photo_time_offset + args.photo_time_diff
 
     photos = collect_photo_paths(args.photo_dir, recursive=args.recursive)
     if not photos:
@@ -464,7 +547,7 @@ def process_photos(args: argparse.Namespace) -> list[PhotoResult]:
         capture_time = capture_time_from_metadata(
             metadata,
             default_tz=default_tz,
-            offset_seconds=args.photo_time_offset,
+            offset_seconds=photo_time_offset_seconds,
             use_file_mtime=args.use_file_mtime,
         )
         if capture_time is None:
@@ -620,7 +703,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--photo-time-offset",
         type=float,
         default=0.0,
-        help="Seconds to add to each photo timestamp before matching the track.",
+        help=(
+            "Seconds to add to each photo timestamp before matching the track. "
+            "Kept for scripts; --photo-time-diff is friendlier for manual use."
+        ),
+    )
+    parser.add_argument(
+        "--photo-time-diff",
+        "--camera-time-offset",
+        dest="photo_time_diff",
+        type=parse_time_delta_seconds,
+        default=0.0,
+        metavar="DELTA",
+        help=(
+            "Time to add to each photo timestamp before matching the track, e.g. "
+            "+1:00:00, -30m, 1h15m, or 5400. Use this when the camera clock "
+            "differs from GPS track time."
+        ),
     )
     parser.add_argument(
         "--max-time-delta",
@@ -649,7 +748,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="exiftool",
         help="ExifTool executable path. Default: exiftool.",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(normalize_time_delta_args(argv))
 
 
 def main(argv: list[str] | None = None) -> int:

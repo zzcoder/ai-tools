@@ -8,6 +8,14 @@ python3 tools/make_photo_slideshow.py
 
 It sorts photos by EXIF timestamp when available, falls back to file modified time, creates an optional title card, concatenates music, writes a timestamp order CSV, and renders MP4 through ffmpeg. Use `--encoder h264_nvenc --gpu 1` to render with the NVIDIA GPU.
 
+The reusable GPX/map slideshow program is:
+
+```bash
+python3 tools/make_map_slideshow.py
+```
+
+It matches GPS-tagged media to a GPX route, inserts OpenStreetMap route transitions between stop groups, keeps the already-walked route visible during each map transition, zooms in for short walks, uses dynamic 10-20 second map durations, holds the destination place/fountain name for 4 seconds at the end of each route clip, and prefers Live Photo sidecar videos over stills when both are available.
+
 ## Basic Use
 
 ```bash
