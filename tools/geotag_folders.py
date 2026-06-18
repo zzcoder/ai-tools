@@ -6,6 +6,11 @@ GPS metadata, then assigns the closest timestamped GPS point to media without
 GPS. By default it only writes CSV reports. Pass --write to write the matched
 GPS metadata back into the missing-GPS files.
 
+All timestamp comparisons are done in GMT/UTC. Timestamps with an embedded
+offset or Exif OffsetTime tag use that offset. Timestamps without timezone
+metadata are assumed to be America/New_York by default, so EST/EDT is chosen
+from the media date.
+
 Examples:
 
     ./tools/geotag_folders.py /media/usb/photos
@@ -108,6 +113,8 @@ GPS_TEXT_TAGS = (
     "GPSPosition",
     "LocationInformation",
 )
+
+DEFAULT_ASSUME_TIMEZONE = "America/New_York"
 
 
 @dataclass(frozen=True)
@@ -224,14 +231,37 @@ def normalize_time_delta_args(argv: list[str]) -> list[str]:
 
 def timezone_from_name(name: str | None) -> tzinfo:
     if not name:
-        tz = datetime.now().astimezone().tzinfo
-        return tz if tz is not None else timezone.utc
+        return ZoneInfo(DEFAULT_ASSUME_TIMEZONE)
     if name.upper() == "UTC":
         return timezone.utc
     try:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError as exc:
         raise ValueError(f"Unknown timezone: {name}") from exc
+
+
+def timestamp_has_offset(value: str) -> bool:
+    text = value.strip()
+    return bool(re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", text))
+
+
+def offset_for_timestamp_tag(metadata: dict[str, Any], tag: str) -> str | None:
+    """Return the Exif offset tag that belongs with a timestamp tag."""
+    if tag in {"SubSecDateTimeOriginal", "DateTimeOriginal"}:
+        offset = metadata.get("OffsetTimeOriginal") or metadata.get("OffsetTime")
+    elif tag in {"SubSecCreateDate", "CreateDate"}:
+        offset = metadata.get("OffsetTimeDigitized") or metadata.get("OffsetTime")
+    else:
+        offset = metadata.get("OffsetTime")
+
+    if offset is None:
+        return None
+    text = str(offset).strip()
+    if re.fullmatch(r"[+-]\d{2}:?\d{2}", text):
+        if ":" not in text:
+            text = f"{text[:3]}:{text[3:]}"
+        return text
+    return None
 
 
 def parse_exif_datetime(
@@ -328,7 +358,12 @@ def capture_time_from_metadata(
         value = metadata.get(tag)
         if not value:
             continue
-        parsed = parse_exif_datetime(str(value), default_tz, offset_seconds)
+        text = str(value)
+        if not timestamp_has_offset(text):
+            tag_offset = offset_for_timestamp_tag(metadata, tag)
+            if tag_offset:
+                text = f"{text}{tag_offset}"
+        parsed = parse_exif_datetime(text, default_tz, offset_seconds)
         if parsed is not None:
             return parsed, tag
 
@@ -351,6 +386,8 @@ def collect_media_paths(folder: Path, recursive: bool, all_files: bool) -> list[
     paths: list[Path] = []
     for path in iterator:
         if not path.is_file():
+            continue
+        if path.name.startswith("._"):
             continue
         if all_files or path.suffix.lower() in MEDIA_EXTENSIONS:
             paths.append(path)
@@ -376,6 +413,9 @@ def run_exiftool_json(exiftool: str, paths: list[Path]) -> list[dict[str, Any]]:
         "-MediaCreateDate",
         "-TrackCreateDate",
         "-DateTimeCreated",
+        "-OffsetTimeOriginal",
+        "-OffsetTimeDigitized",
+        "-OffsetTime",
         "-FileModifyDate",
     ]
     rows: list[dict[str, Any]] = []
@@ -794,7 +834,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--photo-timezone",
         help=(
             "Timezone for timestamps without an offset, e.g. America/New_York. "
-            "Defaults to the local machine timezone."
+            f"Defaults to {DEFAULT_ASSUME_TIMEZONE}, choosing EST/EDT by date."
         ),
     )
     parser.add_argument(

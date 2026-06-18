@@ -67,6 +67,7 @@ class Track:
     cumulative_m: list[float]
     total_m: float
     lat0_rad: float
+    times: list[datetime | None]
 
 
 @dataclass
@@ -81,6 +82,7 @@ class MediaItem:
     duration: float = 0.0
     corrected_time: bool = False
     manifest_name: str | None = None
+    location_source: str = "gps"
 
     @property
     def basename(self) -> str:
@@ -96,6 +98,51 @@ class StopGroup:
     label: str
     waypoint: str | None
     waypoint_distance_m: float | None
+
+
+@dataclass(frozen=True)
+class PlaceArea:
+    name: str
+    lat: float
+    lon: float
+    radius_m: float
+
+
+STOP_SPLIT_AREAS = [
+    PlaceArea("Jefferson Memorial", 38.88139, -77.03650, 180.0),
+    PlaceArea("George Mason Memorial", 38.8794569, -77.0389309, 170.0),
+    PlaceArea("Bolivar Park", 38.8931299, -77.0420303, 180.0),
+    PlaceArea("Senate Fountain of US Capitol", 38.8938198, -77.0090800, 180.0),
+    PlaceArea("East Front Fountain of US Capitol", 38.8898500, -77.0105556, 180.0),
+]
+
+
+PLACE_AREAS = [
+    PlaceArea("East Potomac Park", 38.87563, -77.02605, 650.0),
+    PlaceArea("Ohio Drive SW", 38.87810, -77.02846, 300.0),
+    PlaceArea("Tidal Basin", 38.88075, -77.03125, 700.0),
+    PlaceArea("Jefferson Memorial", 38.88139, -77.03650, 240.0),
+    PlaceArea("West Potomac Park", 38.88430, -77.04010, 500.0),
+    PlaceArea("George Mason Memorial", 38.8794569, -77.0389309, 220.0),
+    PlaceArea("Bolivar Park", 38.8931299, -77.0420303, 220.0),
+    PlaceArea("Constitution Gardens", 38.89108, -77.04110, 450.0),
+    PlaceArea("Freedom Plaza", 38.89585, -77.03078, 350.0),
+    PlaceArea("Federal Triangle", 38.89500, -77.02730, 500.0),
+    PlaceArea("Pennsylvania Avenue NW", 38.89420, -77.02300, 450.0),
+    PlaceArea("John Marshall Park", 38.89281, -77.01751, 350.0),
+    PlaceArea("Senate Fountain of US Capitol", 38.8938198, -77.0090800, 220.0),
+    PlaceArea("Senate Park", 38.89430, -77.00980, 400.0),
+    PlaceArea("Columbus Circle and Union Station", 38.89700, -77.00670, 450.0),
+    PlaceArea("East Front Fountain of US Capitol", 38.8898500, -77.0105556, 240.0),
+    PlaceArea("Capitol Reflecting Pool", 38.89029, -77.01059, 350.0),
+    PlaceArea("U.S. Capitol Grounds", 38.88983, -77.01060, 600.0),
+    PlaceArea("Smithsonian Gardens", 38.88204, -77.02607, 550.0),
+    PlaceArea("National Mall", 38.88770, -77.02600, 700.0),
+]
+
+PLACE_NAME_ALIASES = {
+    "Simon Bolivar Memorial": "Bolivar Park",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,6 +163,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--image-duration", type=float, default=2.0)
     parser.add_argument("--video-max-duration", type=float, default=2.0)
+    parser.add_argument(
+        "--music-trim-end-s",
+        type=float,
+        default=0.0,
+        help="Trim the music source at this second before looping. Use this to skip applause or silence at the tail.",
+    )
+    parser.add_argument(
+        "--music-loop-crossfade-s",
+        type=float,
+        default=8.0,
+        help="Seconds of overlap between repeated music passes when the video is longer than the source track.",
+    )
     parser.add_argument("--route-duration", type=float, default=None, help="Fixed map transition duration. Default is dynamic.")
     parser.add_argument("--route-min-duration", type=float, default=10.0)
     parser.add_argument("--route-max-duration", type=float, default=20.0)
@@ -129,8 +188,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--route-max-distance-m", type=float, default=1400.0)
     parser.add_argument("--min-map-zoom", type=int, default=15)
     parser.add_argument("--max-map-zoom", type=int, default=18)
-    parser.add_argument("--match-distance-m", type=float, default=220.0)
-    parser.add_argument("--cluster-gap-m", type=float, default=300.0)
+    parser.add_argument("--match-distance-m", type=float, default=200.0)
+    parser.add_argument("--waypoint-match-distance-m", type=float, default=260.0)
+    parser.add_argument("--cluster-gap-m", type=float, default=100.0)
     parser.add_argument("--split-time-gap-min", type=float, default=45.0)
     parser.add_argument("--prefer-live-videos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--encoder", choices=("auto", "h264_nvenc", "libx264"), default="auto")
@@ -145,26 +205,46 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def parse_gpx_points(path: Path) -> list[tuple[float, float]]:
+def parse_gpx_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            return parsed
+        return parsed.astimezone(LOCAL_TZ).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def parse_gpx_points(path: Path) -> list[tuple[float, float, datetime | None]]:
     root = ET.parse(path).getroot()
-    points: list[tuple[float, float]] = []
+    points: list[tuple[float, float, datetime | None]] = []
     for element in root.iter():
         if local_name(element.tag) == "trkpt":
-            points.append((float(element.attrib["lat"]), float(element.attrib["lon"])))
+            timestamp = None
+            for child in element:
+                if local_name(child.tag) == "time":
+                    timestamp = parse_gpx_time(child.text)
+                    break
+            points.append((float(element.attrib["lat"]), float(element.attrib["lon"]), timestamp))
     if len(points) < 2:
         raise SystemExit(f"Need at least two GPX track points: {path}")
     return points
 
 
-def build_track(points: list[tuple[float, float]]) -> Track:
-    lat0_rad = math.radians(sum(lat for lat, _ in points) / len(points))
-    xy = [latlon_to_xy(lat, lon, lat0_rad) for lat, lon in points]
+def build_track(points: list[tuple[float, float, datetime | None]]) -> Track:
+    latlon = [(lat, lon) for lat, lon, _ in points]
+    times = [timestamp for _, _, timestamp in points]
+    lat0_rad = math.radians(sum(lat for lat, _ in latlon) / len(latlon))
+    xy = [latlon_to_xy(lat, lon, lat0_rad) for lat, lon in latlon]
     cumulative = [0.0]
     total = 0.0
     for a, b in zip(xy, xy[1:]):
         total += math.hypot(b[0] - a[0], b[1] - a[1])
         cumulative.append(total)
-    return Track(points, xy, cumulative, total, lat0_rad)
+    return Track(latlon, xy, cumulative, total, lat0_rad, times)
 
 
 def latlon_to_xy(lat: float, lon: float, lat0_rad: float) -> tuple[float, float]:
@@ -202,6 +282,38 @@ def project_to_track(track: Track, lat: float, lon: float) -> tuple[float, float
             best_dist = dist
             best_s = track.cumulative_m[index] + math.sqrt(seg_len_sq) * t
     return best_s, best_dist
+
+
+def project_to_track_time(track: Track, capture_dt: datetime) -> tuple[float, float, float] | None:
+    timed_points = [(timestamp, index) for index, timestamp in enumerate(track.times) if timestamp is not None]
+    if len(timed_points) < 2:
+        return None
+    timestamps = [timestamp for timestamp, _ in timed_points]
+    if capture_dt < timestamps[0] or capture_dt > timestamps[-1]:
+        return None
+
+    position = bisect.bisect_left(timestamps, capture_dt)
+    if position < len(timed_points) and timestamps[position] == capture_dt:
+        index = timed_points[position][1]
+        lat, lon = track.latlon[index]
+        return lat, lon, track.cumulative_m[index]
+    if position <= 0 or position >= len(timed_points):
+        return None
+
+    previous_time, previous_index = timed_points[position - 1]
+    next_time, next_index = timed_points[position]
+    span_seconds = (next_time - previous_time).total_seconds()
+    if span_seconds <= 0:
+        lat, lon = track.latlon[previous_index]
+        return lat, lon, track.cumulative_m[previous_index]
+
+    ratio = (capture_dt - previous_time).total_seconds() / span_seconds
+    previous_lat, previous_lon = track.latlon[previous_index]
+    next_lat, next_lon = track.latlon[next_index]
+    lat = previous_lat + (next_lat - previous_lat) * ratio
+    lon = previous_lon + (next_lon - previous_lon) * ratio
+    route_s = track.cumulative_m[previous_index] + (track.cumulative_m[next_index] - track.cumulative_m[previous_index]) * ratio
+    return lat, lon, route_s
 
 
 def route_point_at(track: Track, s: float) -> tuple[float, float]:
@@ -251,17 +363,25 @@ def parse_video_datetime(tags: dict[str, Any]) -> datetime | None:
 
 def rational_to_float(value: Any) -> float:
     if isinstance(value, tuple) and len(value) == 2 and all(isinstance(v, int) for v in value):
-        den = value[1] or 1
+        den = value[1]
+        if den == 0:
+            raise ValueError("Invalid rational value with zero denominator")
         return float(value[0]) / den
-    return float(value)
+    try:
+        return float(value)
+    except ZeroDivisionError as exc:
+        raise ValueError("Invalid rational value with zero denominator") from exc
 
 
 def dms_to_degrees(values: Any, ref: str) -> float | None:
     if not values or len(values) < 3:
         return None
-    degrees = rational_to_float(values[0])
-    minutes = rational_to_float(values[1])
-    seconds = rational_to_float(values[2])
+    try:
+        degrees = rational_to_float(values[0])
+        minutes = rational_to_float(values[1])
+        seconds = rational_to_float(values[2])
+    except (TypeError, ValueError):
+        return None
     result = degrees + minutes / 60.0 + seconds / 3600.0
     if ref.upper() in {"S", "W"}:
         result *= -1
@@ -332,6 +452,67 @@ def load_manifest_corrections(path: Path) -> dict[str, dict[str, Any]]:
     return result
 
 
+def media_name_candidates(path: Path) -> list[str]:
+    candidates: list[str] = []
+    paths = [path]
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    if resolved != path:
+        paths.append(resolved)
+    for candidate_path in paths:
+        candidates.extend([candidate_path.name.lower(), candidate_path.stem.lower()])
+    if "__" in path.name:
+        original_name = path.name.rsplit("__", 1)[-1]
+        original_path = Path(original_name)
+        candidates.extend([original_path.name.lower(), original_path.stem.lower()])
+    return list(dict.fromkeys(candidates))
+
+
+def media_display_name(path: Path, root: Path | None = None) -> str:
+    if root is not None:
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            pass
+    return path.name
+
+
+def media_clip_stem(path: Path, root: Path | None = None) -> str:
+    display = media_display_name(path, root)
+    stem = str(Path(display).with_suffix(""))
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", stem.replace("/", "__")).strip("_") or path.stem
+
+
+def media_base_stem(path: Path) -> str:
+    try:
+        return path.resolve().stem
+    except OSError:
+        if "__" in path.name:
+            return Path(path.name.rsplit("__", 1)[-1]).stem
+        return path.stem
+
+
+def is_ignored_media_path(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+    return any(part.startswith(".") for part in relative.parts)
+
+
+def iter_media_paths(source_dir: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in source_dir.rglob("*")
+            if path.is_file() and not is_ignored_media_path(path, source_dir)
+        ),
+        key=lambda path: media_display_name(path, source_dir).lower(),
+    )
+
+
 def load_waypoints(path: Path) -> list[tuple[str, float, float]]:
     if not path.exists():
         return []
@@ -353,11 +534,7 @@ def load_waypoints(path: Path) -> list[tuple[str, float, float]]:
 def scan_media(args: argparse.Namespace, track: Track) -> list[MediaItem]:
     corrections = load_manifest_corrections(args.decor_manifest)
     selected: list[MediaItem] = []
-    for path in sorted(args.source_dir.iterdir(), key=lambda p: p.name.lower()):
-        if not path.is_file():
-            continue
-        if path.name.startswith("."):
-            continue
+    for path in iter_media_paths(args.source_dir):
         ext = path.suffix.lower()
         if ext in IMAGE_EXTENSIONS:
             dt, lat, lon = extract_image_metadata(path)
@@ -369,7 +546,7 @@ def scan_media(args: argparse.Namespace, track: Track) -> list[MediaItem]:
         else:
             continue
 
-        correction = corrections.get(path.name.lower()) or corrections.get(path.stem.lower())
+        correction = next((corrections[key] for key in media_name_candidates(path) if key in corrections), None)
         corrected_time = False
         manifest_name = None
         if correction:
@@ -378,15 +555,26 @@ def scan_media(args: argparse.Namespace, track: Track) -> list[MediaItem]:
             if corrected:
                 dt = corrected
                 corrected_time = True
-        if not dt or lat is None or lon is None:
+        if not dt:
             continue
         if (dt.month, dt.day) not in {(6, 6), (6, 7)} or dt.year != 2026:
             continue
 
-        route_s, distance = project_to_track(track, lat, lon)
-        if distance > args.match_distance_m:
-            continue
-        selected.append(MediaItem(path, kind, dt, lat, lon, route_s, distance, duration, corrected_time, manifest_name))
+        location_source = "gps"
+        if lat is not None and lon is not None:
+            route_s, distance = project_to_track(track, lat, lon)
+            if distance > args.match_distance_m:
+                continue
+        else:
+            inferred = project_to_track_time(track, dt)
+            if inferred is None:
+                continue
+            lat, lon, route_s = inferred
+            distance = 0.0
+            location_source = "gpx_time"
+        selected.append(
+            MediaItem(path, kind, dt, lat, lon, route_s, distance, duration, corrected_time, manifest_name, location_source)
+        )
     if args.prefer_live_videos:
         selected = prefer_live_photo_videos(selected)
     return selected
@@ -418,16 +606,50 @@ def median(values: list[float]) -> float:
     return (ordered[mid - 1] + ordered[mid]) / 2
 
 
+def nearest_area(lat: float, lon: float, areas: list[PlaceArea]) -> tuple[PlaceArea, float] | None:
+    if not areas:
+        return None
+    area, distance = min(
+        ((area, haversine_m((lat, lon), (area.lat, area.lon))) for area in areas),
+        key=lambda item: item[1],
+    )
+    if distance <= area.radius_m:
+        return area, distance
+    return None
+
+
+def explicit_place_name_for_item(item: MediaItem) -> str | None:
+    match = nearest_area(item.lat, item.lon, STOP_SPLIT_AREAS)
+    return match[0].name if match else None
+
+
+def split_by_explicit_place(items: list[MediaItem]) -> list[list[MediaItem]]:
+    ordered = sorted(items, key=lambda item: (item.route_s, item.capture_dt, media_display_name(item.path).lower()))
+    groups: list[list[MediaItem]] = []
+    current: list[MediaItem] = []
+    current_place: str | None = None
+    for item in ordered:
+        place = explicit_place_name_for_item(item)
+        if current and place != current_place and (place is not None or current_place is not None):
+            groups.append(current)
+            current = []
+        current.append(item)
+        current_place = place
+    if current:
+        groups.append(current)
+    return groups
+
+
 def split_by_time(items: list[MediaItem], gap_minutes: float) -> list[list[MediaItem]]:
-    ordered = sorted(items, key=lambda item: (item.capture_dt, item.path.name.lower()))
+    ordered = sorted(items, key=lambda item: (item.capture_dt, media_display_name(item.path).lower()))
     groups: list[list[MediaItem]] = []
     current: list[MediaItem] = []
     for item in ordered:
         if current:
             gap = (item.capture_dt - current[-1].capture_dt).total_seconds() / 60.0
             unreliable_camera_clock = (
-                (item.path.stem.upper().startswith("DSC_") and not item.corrected_time)
-                or (current[-1].path.stem.upper().startswith("DSC_") and not current[-1].corrected_time)
+                (media_base_stem(item.path).upper().startswith("DSC_") and not item.corrected_time)
+                or (media_base_stem(current[-1].path).upper().startswith("DSC_") and not current[-1].corrected_time)
             )
             if gap > gap_minutes and not unreliable_camera_clock:
                 groups.append(current)
@@ -455,7 +677,8 @@ def group_media(args: argparse.Namespace, track: Track, items: list[MediaItem]) 
 
     split_groups: list[list[MediaItem]] = []
     for route_group in route_groups:
-        split_groups.extend(split_by_time(route_group, args.split_time_gap_min))
+        for place_group in split_by_explicit_place(route_group):
+            split_groups.extend(split_by_time(place_group, args.split_time_gap_min))
 
     earliest = min(items, key=lambda item: item.capture_dt)
     earliest_time = earliest.capture_dt
@@ -477,9 +700,9 @@ def group_media(args: argparse.Namespace, track: Track, items: list[MediaItem]) 
                 key=lambda waypoint: haversine_m((group_lat, group_lon), (waypoint[1], waypoint[2])),
             )
             waypoint_dist = haversine_m((group_lat, group_lon), (wlat, wlon))
-            if waypoint_dist > 260:
+            if waypoint_dist > args.waypoint_match_distance_m:
                 waypoint_name = None
-        groups.append(StopGroup(0, sorted(raw_group, key=lambda item: (item.capture_dt, item.path.name.lower())), group_s, order_s, "", waypoint_name, waypoint_dist))
+        groups.append(StopGroup(0, sorted(raw_group, key=lambda item: (item.capture_dt, media_display_name(item.path).lower())), group_s, order_s, "", waypoint_name, waypoint_dist))
 
     groups.sort(key=lambda group: group.order_s)
     for index, group in enumerate(groups, start=1):
@@ -494,13 +717,23 @@ def clean_place_name(name: str | None) -> str | None:
     if not name:
         return None
     cleaned = re.sub(r"^\s*\d+\s*[.)-]\s*", "", str(name)).strip()
-    return cleaned or None
+    if not cleaned:
+        return None
+    return PLACE_NAME_ALIASES.get(cleaned, cleaned)
 
 
 def place_name_for_group(group: StopGroup) -> str:
     waypoint = clean_place_name(group.waypoint)
     if waypoint:
         return waypoint
+
+    explicit_counts: dict[str, int] = {}
+    for item in group.items:
+        name = explicit_place_name_for_item(item)
+        if name:
+            explicit_counts[name] = explicit_counts.get(name, 0) + 1
+    if explicit_counts:
+        return sorted(explicit_counts.items(), key=lambda item: (-item[1], item[0].lower()))[0][0]
 
     counts: dict[str, int] = {}
     for item in group.items:
@@ -509,6 +742,11 @@ def place_name_for_group(group: StopGroup) -> str:
             counts[name] = counts.get(name, 0) + 1
     if counts:
         return sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))[0][0]
+    group_lat = sum(item.lat for item in group.items) / len(group.items)
+    group_lon = sum(item.lon for item in group.items) / len(group.items)
+    match = nearest_area(group_lat, group_lon, PLACE_AREAS)
+    if match:
+        return match[0].name
     return group.label
 
 
@@ -530,6 +768,7 @@ def write_reports(args: argparse.Namespace, groups: list[StopGroup], selected: l
                 "duration",
                 "corrected_time",
                 "manifest_name",
+                "location_source",
             ]
         )
         by_id = {item.path: group.index for group in groups for item in group.items}
@@ -538,7 +777,7 @@ def write_reports(args: argparse.Namespace, groups: list[StopGroup], selected: l
                 [
                     by_id.get(item.path, ""),
                     item.kind,
-                    item.path.name,
+                    media_display_name(item.path, args.source_dir),
                     item.capture_dt.isoformat(sep=" "),
                     f"{item.lat:.7f}",
                     f"{item.lon:.7f}",
@@ -547,6 +786,7 @@ def write_reports(args: argparse.Namespace, groups: list[StopGroup], selected: l
                     f"{item.duration:.3f}",
                     item.corrected_time,
                     item.manifest_name or "",
+                    item.location_source,
                 ]
             )
     summary = {
@@ -554,6 +794,8 @@ def write_reports(args: argparse.Namespace, groups: list[StopGroup], selected: l
         "selected_media": len(selected),
         "images": sum(1 for item in selected if item.kind == "image"),
         "videos": sum(1 for item in selected if item.kind == "video"),
+        "gps_location_count": sum(1 for item in selected if item.location_source == "gps"),
+        "gpx_time_location_count": sum(1 for item in selected if item.location_source == "gpx_time"),
         "track_length_m": round(track.total_m, 1),
         "group_count": len(groups),
         "groups": [
@@ -569,7 +811,7 @@ def write_reports(args: argparse.Namespace, groups: list[StopGroup], selected: l
                 "waypoint": group.waypoint,
                 "place_name": place_name_for_group(group),
                 "waypoint_distance_m": None if group.waypoint_distance_m is None else round(group.waypoint_distance_m, 1),
-                "sample_files": [item.path.name for item in group.items[:8]],
+                "sample_files": [media_display_name(item.path, args.source_dir) for item in group.items[:8]],
             }
             for group in groups
         ],
@@ -689,7 +931,7 @@ def compose_image_frame(args: argparse.Namespace, source: Path) -> Path:
 
 def clip_path_for_media(args: argparse.Namespace, group: StopGroup, item: MediaItem, index: int) -> Path:
     clips_dir = args.build_dir / "clips"
-    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", item.path.stem)
+    safe_stem = media_clip_stem(item.path, args.source_dir)
     return clips_dir / f"g{group.index:02d}_{index:03d}_{item.kind}_{safe_stem}.mp4"
 
 
@@ -1290,10 +1532,10 @@ def render_media_clips(args: argparse.Namespace, groups: list[StopGroup], encode
             done += 1
             target = clip_path_for_media(args, group, item, index)
             if item.kind == "image":
-                print(f"[{done}/{total}] Image {item.path.name}", flush=True)
+                print(f"[{done}/{total}] Image {media_display_name(item.path, args.source_dir)}", flush=True)
                 render_image_clip(args, item.path, target, encoder)
             else:
-                print(f"[{done}/{total}] Video {item.path.name}", flush=True)
+                print(f"[{done}/{total}] Video {media_display_name(item.path, args.source_dir)}", flush=True)
                 render_video_clip(args, item.path, target, item.duration, encoder)
             rendered[item.path] = target
     return rendered
@@ -1331,21 +1573,74 @@ def concatenate_clips(args: argparse.Namespace, clips: list[Path], encoder: str)
 
 def add_music(args: argparse.Namespace, video: Path) -> Path:
     duration = ffprobe_duration(video)
+    source_duration = ffprobe_duration(args.music)
+    if source_duration <= 0:
+        raise SystemExit(f"Music has no usable duration: {args.music}")
+    source_end = args.music_trim_end_s if args.music_trim_end_s > 0 else source_duration
+    source_end = min(source_end, source_duration)
+    if source_end <= 0:
+        raise SystemExit(f"Music trim leaves no usable audio: {args.music}")
+
     fade_start = max(0.0, duration - 6.0)
     audio = args.build_dir / "music-faded.m4a"
+    if duration <= source_end:
+        filter_complex = (
+            f"[0:a]atrim=start=0:end={duration:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d=1.0,afade=t=out:st={fade_start:.3f}:d=6.0[a]"
+        )
+    else:
+        crossfade = min(max(0.0, args.music_loop_crossfade_s), source_end / 2)
+        if crossfade <= 0:
+            raise SystemExit("Music is shorter than the video; set --music-loop-crossfade-s above 0 to loop it.")
+        stride = source_end - crossfade
+        if stride <= 0:
+            raise SystemExit("Music loop cross-fade is too long for the trimmed source.")
+        repeats = math.ceil((duration - source_end) / stride) + 1
+        if repeats > 20:
+            raise SystemExit(f"Refusing to build {repeats} repeated music layers for {duration:.1f}s video.")
+
+        split_outputs = "".join(f"[src{i}]" for i in range(repeats))
+        filters = [f"[0:a]asplit={repeats}{split_outputs}"]
+        for index in range(repeats):
+            start = index * stride
+            segment_duration = min(source_end, duration - start)
+            if segment_duration <= 0:
+                continue
+            chain = f"[src{index}]atrim=start=0:end={segment_duration:.3f},asetpts=PTS-STARTPTS"
+            has_next = index < repeats - 1 and start + segment_duration < duration
+            if index > 0:
+                chain += f",afade=t=in:st=0:d={crossfade:.3f}"
+            if has_next:
+                out_start = max(0.0, segment_duration - crossfade)
+                chain += f",afade=t=out:st={out_start:.3f}:d={crossfade:.3f}"
+            if index > 0:
+                delay_ms = round(start * 1000)
+                chain += f",adelay={delay_ms}:all=1"
+            chain += f"[a{index}]"
+            filters.append(chain)
+        inputs = "".join(f"[a{i}]" for i in range(repeats))
+        filters.append(
+            f"{inputs}amix=inputs={repeats}:duration=longest:normalize=0:dropout_transition=0,"
+            f"afade=t=in:st=0:d=1.0,afade=t=out:st={fade_start:.3f}:d=6.0,"
+            f"atrim=start=0:end={duration:.3f},asetpts=PTS-STARTPTS[a]"
+        )
+        filter_complex = ";".join(filters)
+
     run(
         [
             "ffmpeg",
             "-y",
             "-i",
             str(args.music),
+            "-filter_complex",
+            filter_complex,
             "-map",
-            "0:a:0",
+            "[a]",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
             "-vn",
-            "-t",
-            f"{duration:.3f}",
-            "-af",
-            f"afade=t=in:st=0:d=1.0,afade=t=out:st={fade_start:.3f}:d=6.0",
             "-c:a",
             "aac",
             "-b:a",
@@ -1366,11 +1661,14 @@ def add_music(args: argparse.Namespace, video: Path) -> Path:
             "0:v:0",
             "-map",
             "1:a:0",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
             "-c:v",
             "copy",
             "-c:a",
-            "aac",
-            "-shortest",
+            "copy",
             "-movflags",
             "+faststart",
             str(args.output),

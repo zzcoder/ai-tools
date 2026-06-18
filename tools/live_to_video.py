@@ -23,6 +23,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -58,8 +59,10 @@ IPHONE_SIDECAR_PRIORITY = {".mov": 0, ".m4v": 1, ".mp4": 2}
 @dataclass
 class Summary:
     copied: int = 0
+    detected_iphone_live_stills: int = 0
     converted_iphone: int = 0
     converted_android: int = 0
+    missing_iphone_sidecars: int = 0
     skipped_sidecars: int = 0
     skipped_existing: int = 0
     errors: int = 0
@@ -73,16 +76,81 @@ def is_video(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
 
 
+def is_hidden_or_appledouble(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+    return any(part.startswith(".") for part in relative.parts)
+
+
 def iter_files(folder: Path, recursive: bool) -> list[Path]:
     iterator = folder.rglob("*") if recursive else folder.iterdir()
-    return sorted(path for path in iterator if path.is_file())
+    return sorted(
+        path
+        for path in iterator
+        if path.is_file() and not is_hidden_or_appledouble(path, folder)
+    )
 
 
 def media_key(path: Path) -> tuple[Path, str]:
     return path.parent.resolve(), path.stem.lower()
 
 
-def build_iphone_sidecar_map(files: list[Path]) -> dict[Path, Path]:
+def metadata_value(metadata: dict[str, object], *keys: str) -> str | None:
+    for key in keys:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def is_apple_live_photo_still(metadata: dict[str, object]) -> bool:
+    return metadata_value(metadata, "LivePhotoVideoIndex") is not None
+
+
+def apple_live_photo_identifier(metadata: dict[str, object]) -> str | None:
+    return metadata_value(metadata, "ContentIdentifier", "MediaGroupUUID")
+
+
+def read_exiftool_metadata(files: list[Path], args: argparse.Namespace) -> dict[Path, dict[str, object]]:
+    exiftool = shutil.which(args.exiftool)
+    if not exiftool:
+        return {}
+
+    metadata: dict[Path, dict[str, object]] = {}
+    # One batch invocation is much faster than invoking exiftool per image.
+    command = [
+        exiftool,
+        "-j",
+        "-ContentIdentifier",
+        "-MediaGroupUUID",
+        "-LivePhotoVideoIndex",
+        *[str(path) for path in files if is_image(path) or is_video(path)],
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if not completed.stdout.strip():
+        return {}
+    try:
+        rows = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+    for row in rows:
+        source_file = row.get("SourceFile")
+        if not source_file:
+            continue
+        metadata[Path(str(source_file)).resolve()] = row
+    return metadata
+
+
+def build_iphone_sidecar_map(
+    files: list[Path],
+    metadata_by_path: dict[Path, dict[str, object]] | None = None,
+) -> dict[Path, Path]:
     videos_by_key: dict[tuple[Path, str], list[Path]] = {}
     for path in files:
         if is_video(path):
@@ -99,6 +167,32 @@ def build_iphone_sidecar_map(files: list[Path]) -> dict[Path, Path]:
             sidecars,
             key=lambda item: (IPHONE_SIDECAR_PRIORITY.get(item.suffix.lower(), 99), item.name.lower()),
         )[0]
+
+    if metadata_by_path:
+        videos_by_identifier: dict[str, list[Path]] = {}
+        for path in files:
+            if not is_video(path):
+                continue
+            identifier = apple_live_photo_identifier(metadata_by_path.get(path.resolve(), {}))
+            if identifier:
+                videos_by_identifier.setdefault(identifier, []).append(path)
+
+        for path in files:
+            if not is_image(path) or path in result:
+                continue
+            metadata = metadata_by_path.get(path.resolve(), {})
+            if not is_apple_live_photo_still(metadata):
+                continue
+            identifier = apple_live_photo_identifier(metadata)
+            if not identifier:
+                continue
+            sidecars = videos_by_identifier.get(identifier, [])
+            if not sidecars:
+                continue
+            result[path] = sorted(
+                sidecars,
+                key=lambda item: (IPHONE_SIDECAR_PRIORITY.get(item.suffix.lower(), 99), item.name.lower()),
+            )[0]
     return result
 
 
@@ -186,6 +280,39 @@ def remux_video(source: Path, target: Path, args: argparse.Namespace) -> None:
         raise RuntimeError(message)
 
 
+def is_valid_video(path: Path, args: argparse.Namespace) -> bool:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return True
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.returncode == 0 and "video" in completed.stdout
+
+
+def keep_valid_video_or_remove(target: Path, args: argparse.Namespace) -> bool:
+    if args.dry_run:
+        return True
+    if is_valid_video(target, args):
+        return True
+    target.unlink(missing_ok=True)
+    return False
+
+
 def convert_iphone_live_photo(
     still: Path,
     sidecar: Path,
@@ -236,6 +363,10 @@ def find_mp4_payload_offset(source: Path) -> int | None:
     if index < 4:
         return None
     start = index - 4
+    # If the only ftyp box is at byte 0, this is the image container itself
+    # (for example HEIC), not an appended motion-photo video payload.
+    if start == 0:
+        return None
     box_size = int.from_bytes(data[start:index], byteorder="big", signed=False)
     if box_size < 8 or start + box_size > len(data):
         return None
@@ -267,12 +398,18 @@ def convert_android_motion_photo(
         return True
 
     if exiftool_extract_embedded_video(source, target, args):
-        action = "would extract" if args.dry_run else "extracted"
-        print(f"{action}: {source} -> {target} (Android motion photo)")
-        summary.converted_android += 1
-        return True
+        if not keep_valid_video_or_remove(target, args):
+            print(f"ignored invalid embedded video: {source}")
+        else:
+            action = "would extract" if args.dry_run else "extracted"
+            print(f"{action}: {source} -> {target} (Android motion photo)")
+            summary.converted_android += 1
+            return True
 
     if trailer_extract_embedded_video(source, target, args):
+        if not keep_valid_video_or_remove(target, args):
+            print(f"ignored invalid trailer video: {source}")
+            return False
         action = "would extract" if args.dry_run else "extracted"
         print(f"{action}: {source} -> {target} (Android motion photo trailer)")
         summary.converted_android += 1
@@ -292,9 +429,16 @@ def process(args: argparse.Namespace) -> Summary:
         dest_root.mkdir(parents=True, exist_ok=True)
 
     files = iter_files(source_root, args.recursive)
-    sidecars_by_still = build_iphone_sidecar_map(files)
+    metadata_by_path = read_exiftool_metadata(files, args)
+    sidecars_by_still = build_iphone_sidecar_map(files, metadata_by_path)
     consumed_sidecars = set(sidecars_by_still.values())
     summary = Summary()
+    apple_live_stills = {
+        path
+        for path in files
+        if is_image(path) and is_apple_live_photo_still(metadata_by_path.get(path.resolve(), {}))
+    } | set(sidecars_by_still.keys())
+    summary.detected_iphone_live_stills = len(apple_live_stills)
 
     for source in files:
         try:
@@ -312,6 +456,18 @@ def process(args: argparse.Namespace) -> Summary:
                     video_target_for(source_root, dest_root, source),
                     args,
                     summary,
+                )
+                continue
+
+            if source in apple_live_stills:
+                print(f"missing sidecar: {source} (Apple Live Photo still has no matching video in this export)")
+                summary.missing_iphone_sidecars += 1
+                copy_file(
+                    source,
+                    target,
+                    args,
+                    summary,
+                    "Apple Live Photo still without video sidecar",
                 )
                 continue
 
@@ -338,8 +494,10 @@ def print_summary(summary: Summary, dry_run: bool) -> None:
     prefix = "would " if dry_run else ""
     print("Summary:")
     print(f"  {prefix}copy regular files: {summary.copied}")
+    print(f"  detected iPhone Live Photo stills: {summary.detected_iphone_live_stills}")
     print(f"  {prefix}convert iPhone Live Photos: {summary.converted_iphone}")
     print(f"  {prefix}convert Android motion photos: {summary.converted_android}")
+    print(f"  iPhone Live Photo stills missing video sidecar: {summary.missing_iphone_sidecars}")
     print(f"  skipped consumed iPhone sidecars: {summary.skipped_sidecars}")
     print(f"  skipped existing outputs: {summary.skipped_existing}")
     print(f"  errors: {summary.errors}")
